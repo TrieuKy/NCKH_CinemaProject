@@ -15,18 +15,21 @@ import sys
 from datetime import date, time, timedelta
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import numpy as np
 import pandas as pd
 
-from core.holidays import get_holidays_range
+from core.holidays import get_holidays_range, get_peak_days_range
 
 SEED = 42
 WALK_IN_RATE = 0.70
 ANOMALY_TXN_RATE = 0.015
 ANOMALY_FNB_RATE = 0.015
-# Giữ đúng 18 tháng nhưng thu nhỏ SL vé (~80–120k dòng) cho máy sinh viên.
 VOLUME_SCALE = 1.0
-START = date(2025, 4, 1)
+START = date(2025, 10, 1)
 END = date(2026, 9, 30)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -152,13 +155,15 @@ AGE_PROBS = np.array([0.08, 0.28, 0.30, 0.18, 0.10, 0.06])
 
 
 HOLIDAYS: dict[date, str] = {}
+PEAK_DAYS: dict[date, str] = {}
 
 
 def build_holidays() -> None:
-    """Nạp ngày lễ từ core.holidays — nguồn duy nhất."""
+    """Nạp ngày lễ và ngày cao điểm từ core.holidays — nguồn duy nhất."""
     HOLIDAYS.clear()
     HOLIDAYS.update(get_holidays_range(START.year, END.year))
-
+    PEAK_DAYS.clear()
+    PEAK_DAYS.update(get_peak_days_range(START.year, END.year))
 
 
 def daterange(start: date, end: date):
@@ -180,11 +185,12 @@ def time_slot_of(t: time) -> str:
 
 def day_bucket(d: date) -> tuple[str, str, bool, str]:
     """Trả (day_type giá, occ_bucket, is_weekend, holiday_name)."""
-    holiday_name = HOLIDAYS.get(d, "")
-    is_holiday = bool(holiday_name)
     is_weekend = d.weekday() >= 5
-    if is_holiday:
-        return "holiday", "holiday", is_weekend, holiday_name
+    if d in HOLIDAYS:
+        return "holiday", "holiday", is_weekend, HOLIDAYS[d]
+    if d in PEAK_DAYS:
+        # Ngày cao điểm: áp giá holiday, đông khách, nhưng không phải lễ chính thức
+        return "holiday", "holiday", is_weekend, ""
     if is_weekend:
         return "weekend", "weekend", True, ""
     if d.weekday() == 4:
@@ -224,8 +230,8 @@ def occupancy(occ_bucket: str, slot: str, cinema_occ_mult: float, age_mult: floa
 
 
 def showtimes_for(d: date, room: dict, is_holiday: bool, is_weekend: bool) -> list[time]:
-    """Ít suất ngày thường, đủ suất cuối tuần/lễ — vẫn thể hiện quy luật hành vi."""
-    busy = is_holiday or is_weekend
+    """Ít suất ngày thường, đủ suất cuối tuần/lễ/cao điểm — vẫn thể hiện quy luật hành vi."""
+    busy = is_holiday or is_weekend or (d in PEAK_DAYS)
     if room["room_type"] == "IMAX":
         return SHOW_TIMES if busy else [time(14, 0), time(16, 30), time(19, 0), time(21, 15)]
     if busy:
@@ -233,12 +239,6 @@ def showtimes_for(d: date, room: dict, is_holiday: bool, is_weekend: bool) -> li
     if d.weekday() == 4:  # Thứ 6
         return [time(14, 0), time(16, 30), time(19, 0), time(21, 15)]
     return [time(14, 0), time(19, 0), time(21, 15)]
-
-
-def seat_code(idx: int) -> str:
-    row = idx // 12
-    col = idx % 12 + 1
-    return f"{chr(ord('A') + row)}{col}"
 
 
 def member_discount(tier: str) -> float:
@@ -304,9 +304,8 @@ def generate() -> tuple[pd.DataFrame, pd.DataFrame]:
     txn_meta: list[dict] = []
 
     txn_seq = 1
-    ticket_seq = 1
 
-    print("Đang sinh suất chiếu và vé...")
+    print("Đang sinh suất chiếu và giao dịch vé...")
     for show_day in daterange(START, END):
         day_type, occ_bucket, is_weekend, holiday_name = day_bucket(show_day)
         is_holiday = bool(holiday_name)
@@ -328,7 +327,6 @@ def generate() -> tuple[pd.DataFrame, pd.DataFrame]:
                 n_sold = max(3, min(n_sold, room["capacity"]))
 
                 remaining = n_sold
-                seat_idx = 0
                 list_price = LIST_PRICE[(room["room_type"], day_type)]
 
                 while remaining > 0:
@@ -365,56 +363,51 @@ def generate() -> tuple[pd.DataFrame, pd.DataFrame]:
                             "is_holiday": is_holiday,
                         }
                     )
-                    for _ in range(party):
-                        ticket_rows.append(
-                            {
-                                "txn_id": txn_id,
-                                "ticket_id": f"TKT{ticket_seq:08d}",
-                                "show_date": show_day.isoformat(),
-                                "show_time": show_t.strftime("%H:%M:%S"),
-                                "cinema_id": cinema["cinema_id"],
-                                "cinema_name": cinema["cinema_name"],
-                                "district": cinema["district"],
-                                "city": cinema["city"],
-                                "room_id": room["room_id"],
-                                "room_name": room["room_name"],
-                                "room_type": room["room_type"],
-                                "capacity": room["capacity"],
-                                "movie_id": movie["movie_id"],
-                                "movie_title": movie["title"],
-                                "genre": movie["genre"],
-                                "duration_min": movie["duration_min"],
-                                "rating": movie["rating"],
-                                "release_date": movie["release_date"].isoformat(),
-                                "language": movie["language"],   # [G] bổ sung để dim_movie đủ cột
-                                "country": movie["country"],     # [G] bổ sung để dim_movie đủ cột
-                                "customer_id": cust["customer_id"],
-                                "customer_type": cust["customer_type"],
-                                "gender": cust["gender"],
-                                "age_group": cust["age_group"],
-                                "membership_tier": cust["membership_tier"],
-                                "seat_code": seat_code(seat_idx),
-                                "channel_code": channel,
-                                "ticket_format": room["room_type"],
-                                "day_type": day_type,
-                                "time_slot": slot,
-                                "list_price": list_price,
-                                "discount_rate": round(rate, 4),
-                                "discount_amount": disc,
-                                "paid_amount": paid,
-                                "qty": 1,
-                                "is_holiday": int(is_holiday),
-                                "holiday_name": holiday_name,
-                                "is_anomaly": 0,
-                                "anomaly_type": "",
-                            }
-                        )
-                        ticket_seq += 1
-                        seat_idx += 1
+                    ticket_rows.append(
+                        {
+                            "txn_id": txn_id,
+                            "show_date": show_day.isoformat(),
+                            "show_time": show_t.strftime("%H:%M:%S"),
+                            "cinema_id": cinema["cinema_id"],
+                            "cinema_name": cinema["cinema_name"],
+                            "district": cinema["district"],
+                            "city": cinema["city"],
+                            "room_id": room["room_id"],
+                            "room_name": room["room_name"],
+                            "room_type": room["room_type"],
+                            "capacity": room["capacity"],
+                            "movie_id": movie["movie_id"],
+                            "movie_title": movie["title"],
+                            "genre": movie["genre"],
+                            "duration_min": movie["duration_min"],
+                            "rating": movie["rating"],
+                            "release_date": movie["release_date"].isoformat(),
+                            "language": movie["language"],
+                            "country": movie["country"],
+                            "customer_id": cust["customer_id"],
+                            "customer_type": cust["customer_type"],
+                            "gender": cust["gender"],
+                            "age_group": cust["age_group"],
+                            "membership_tier": cust["membership_tier"],
+                            "channel_code": channel,
+                            "ticket_format": room["room_type"],
+                            "day_type": day_type,
+                            "time_slot": slot,
+                            "list_price": list_price,
+                            "discount_rate": round(rate, 4),
+                            "discount_amount": disc * party,
+                            "paid_amount": paid * party,
+                            "qty": party,
+                            "is_holiday": int(is_holiday),
+                            "holiday_name": holiday_name,
+                            "is_anomaly": 0,
+                            "anomaly_type": "",
+                        }
+                    )
                     remaining -= party
 
     tickets = pd.DataFrame(ticket_rows)
-    print(f"  Vé bình thường: {len(tickets):,} dòng | Giao dịch: {tickets['txn_id'].nunique():,}")
+    print(f"  Giao dịch vé bình thường: {len(tickets):,} dòng | Tổng vé: {tickets['qty'].sum():,}")
 
     tickets = inject_ticket_anomalies(tickets)
     fnb = generate_fnb(txn_meta)
@@ -423,7 +416,7 @@ def generate() -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def inject_ticket_anomalies(tickets: pd.DataFrame) -> pd.DataFrame:
-    """1–2% dòng vé: giá 0đ, doanh thu lệch, hoặc vượt capacity."""
+    """1–2% dòng giao dịch vé: giá 0đ, doanh thu lệch, hoặc vượt capacity."""
     print("Đang gieo nhãn bất thường trên vé...")
     txn_ids = tickets["txn_id"].unique()
     n_anom_txn = max(1, int(round(len(txn_ids) * ANOMALY_TXN_RATE)))
@@ -446,7 +439,11 @@ def inject_ticket_anomalies(tickets: pd.DataFrame) -> pd.DataFrame:
     mismatch_idx = tickets.index[mismatch_mask].to_numpy()
     if len(mismatch_idx):
         half = RNG.random(len(mismatch_idx)) < 0.5
-        tickets.loc[mismatch_idx[half], "paid_amount"] = tickets.loc[mismatch_idx[half], "list_price"].to_numpy()
+        # Nửa đầu: thu theo giá niêm yết nguyên giá (bỏ qua chiết khấu)
+        tickets.loc[mismatch_idx[half], "paid_amount"] = (
+            tickets.loc[mismatch_idx[half], "list_price"].to_numpy() * tickets.loc[mismatch_idx[half], "qty"].to_numpy()
+        )
+        # Nửa sau: thu gấp đôi
         tickets.loc[mismatch_idx[~half], "paid_amount"] = (
             tickets.loc[mismatch_idx[~half], "paid_amount"].to_numpy() * 2
         )
@@ -459,20 +456,23 @@ def inject_ticket_anomalies(tickets: pd.DataFrame) -> pd.DataFrame:
         templates = tickets[tickets["txn_id"].isin(spike_ids)].drop_duplicates(
             ["txn_id"], keep="first"
         )
-        show_counts = tickets.groupby(["room_id", "show_date", "show_time"]).size()
+        show_totals = tickets.groupby(["room_id", "show_date", "show_time"])["qty"].sum()
         seq = 1
         for _, rec in templates.iterrows():
-            already = int(show_counts.loc[(rec["room_id"], rec["show_date"], rec["show_time"])])
-            overflow = max(4, int(round(int(rec["capacity"]) * 0.05)))
-            base = rec.to_dict()
-            for i in range(overflow):
-                extra = dict(base)
-                extra["ticket_id"] = f"TKT9{seq:07d}"
-                extra["seat_code"] = seat_code(already + i)
-                extra["is_anomaly"] = 1
-                extra["anomaly_type"] = "qty_spike"
-                extra_rows.append(extra)
-                seq += 1
+            already = int(show_totals.loc[(rec["room_id"], rec["show_date"], rec["show_time"])])
+            cap = int(rec["capacity"])
+            # Số vé overflow để tổng số vé trong suất vượt sức chứa phòng
+            overflow = max(5, cap - already + int(round(cap * 0.08)))
+            extra = rec.to_dict()
+            extra["txn_id"] = f"TXN9{seq:07d}"
+            extra["qty"] = overflow
+            extra["paid_amount"] = int(extra["list_price"]) * overflow
+            extra["discount_amount"] = 0
+            extra["discount_rate"] = 0.0
+            extra["is_anomaly"] = 1
+            extra["anomaly_type"] = "qty_spike"
+            extra_rows.append(extra)
+            seq += 1
 
     if extra_rows:
         tickets = pd.concat([tickets, pd.DataFrame(extra_rows)], ignore_index=True)
@@ -542,23 +542,25 @@ def validate(tickets: pd.DataFrame, fnb: pd.DataFrame) -> None:
     n_f = len(fnb)
     walk_in_txn = tickets.drop_duplicates("txn_id")
     walk_rate = (walk_in_txn["customer_type"] == "WALK_IN").mean()
-    anom_t = tickets["is_anomaly"].mean()
-    anom_f = fnb["is_anomaly"].mean() if n_f else 0
+    anom_t = (tickets["is_anomaly"] == 1).mean()
+    anom_f = (fnb["is_anomaly"] == 1).mean() if n_f else 0
     orphan = ~fnb["txn_id"].isin(tickets["txn_id"]) if n_f else pd.Series(dtype=bool)
 
+    # Kiểm tra vượt sức chứa ngoài các suất được chủ đích gieo qty_spike
+    spike_mask = tickets["anomaly_type"].eq("qty_spike")
+    non_spike = tickets[~spike_mask]
     sold_vs_cap = (
-        tickets.assign(is_spike=tickets["anomaly_type"].eq("qty_spike"))
-        .groupby(["room_id", "show_date", "show_time", "capacity"], as_index=False)
-        .agg(sold=("ticket_id", "count"), spikes=("is_spike", "sum"))
+        non_spike.groupby(["room_id", "show_date", "show_time", "capacity"], as_index=False)["qty"]
+        .sum()
+        .rename(columns={"qty": "legal_sold"})
     )
-    sold_vs_cap["legal_sold"] = sold_vs_cap["sold"] - sold_vs_cap["spikes"]
     over = sold_vs_cap[sold_vs_cap["legal_sold"] > sold_vs_cap["capacity"]]
 
-    print(f"Vé: {n_t:,} | F&B: {n_f:,}")
+    print(f"Dòng giao dịch vé: {n_t:,} | Tổng vé: {tickets['qty'].sum():,} | F&B: {n_f:,}")
     print(f"Tỷ lệ GUEST/WALK_IN theo giao dịch: {walk_rate:.2%}")
-    print(f"Anomaly vé: {anom_t:.2%} | Anomaly F&B: {anom_f:.2%}")
+    print(f"Anomaly vé (theo dòng giao dịch): {anom_t:.2%} | Anomaly F&B: {anom_f:.2%}")
     print(f"F&B mồ côi (txn không có vé): {int(orphan.sum())}")
-    print(f"Suất vượt capacity ngoài qty_spike: {len(over)}")
+    print(f"Suất hợp lệ vượt capacity: {len(over)}")
     print(f"Khoảng ngày: {tickets['show_date'].min()} → {tickets['show_date'].max()}")
     print(f"Số rạp: {tickets['cinema_id'].nunique()} | Số phim: {tickets['movie_id'].nunique()}")
 
@@ -586,4 +588,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     sys.exit(main())
