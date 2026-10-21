@@ -15,7 +15,7 @@
 SET search_path TO cinema_dw, staging, public;
 
 -- =============================================================================
--- 1. dim_date — generate_series toàn bộ 18 tháng + cờ lễ từ staging
+-- 1. dim_date — generate_series toàn bộ 12 tháng + cờ lễ từ staging
 -- =============================================================================
 -- Lý do dùng generate_series thay vì DISTINCT từ staging:
 --   Đảm bảo phủ đủ mọi ngày kể cả ngày không có vé (rạp đóng cửa).
@@ -23,7 +23,7 @@ SET search_path TO cinema_dw, staging, public;
 INSERT INTO cinema_dw.dim_date (
     date_key, full_date, day_of_month, month_no, month_name,
     quarter_no, year_no, week_of_year, day_of_week, day_name,
-    is_weekend, is_holiday, holiday_name
+    is_weekend, is_holiday, is_peak_day, holiday_name
 )
 WITH holidays AS (
     -- Tổng hợp ngày lễ từ staging (DISTINCT phòng khi cùng ngày nhiều phòng chiếu)
@@ -34,11 +34,11 @@ WITH holidays AS (
     WHERE is_holiday = 1
 )
 SELECT
-    TO_CHAR(d, 'YYYYMMDD')::INTEGER,            -- 20250401
+    TO_CHAR(d, 'YYYYMMDD')::INTEGER,            -- 20251001
     d::DATE,
     EXTRACT(DAY     FROM d)::SMALLINT,
     EXTRACT(MONTH   FROM d)::SMALLINT,
-    TRIM(TO_CHAR(d, 'Month')),                   -- 'April', 'May', …
+    TRIM(TO_CHAR(d, 'Month')),                   -- 'October', …
     EXTRACT(QUARTER FROM d)::SMALLINT,
     EXTRACT(YEAR    FROM d)::SMALLINT,
     EXTRACT(WEEK    FROM d)::SMALLINT,
@@ -46,9 +46,13 @@ SELECT
     TRIM(TO_CHAR(d, 'Day')),                     -- 'Monday', …
     EXTRACT(ISODOW  FROM d) >= 6,               -- TRUE nếu Thứ 7 hoặc CN
     (h.hdate IS NOT NULL),                       -- is_holiday
+    (
+        (EXTRACT(MONTH FROM d) = 10 AND EXTRACT(DAY FROM d) = 20)
+        OR (EXTRACT(MONTH FROM d) = 12 AND EXTRACT(DAY FROM d) IN (24, 25))
+    )                                            AS is_peak_day,
     h.holiday_name
 FROM generate_series(
-    '2025-04-01'::DATE,
+    '2025-10-01'::DATE,
     '2026-09-30'::DATE,
     '1 day'::INTERVAL
 ) AS g(d)
@@ -225,7 +229,7 @@ SELECT DISTINCT ON (pricing_id)
         WHEN customer_type = 'MEMBER'                          THEN 'Hội viên'
         ELSE NULL
     END                                                         AS discount_name,
-    '2025-04-01'::DATE                                          AS effective_from,
+    '2025-10-01'::DATE                                          AS effective_from,
     NULL                                                        AS effective_to
 FROM staging.ticket
 WHERE is_anomaly = 0

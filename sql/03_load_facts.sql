@@ -29,7 +29,7 @@ TRUNCATE cinema_dw.fact_fnb    RESTART IDENTITY CASCADE;
 INSERT INTO cinema_dw.fact_ticket (
     date_key, time_key, movie_key, cinema_key, room_key,
     customer_key, pricing_key, channel_key,
-    txn_id, ticket_id, seat_code,
+    txn_id,
     qty, list_price, discount_amount, net_amount,
     is_anomaly, anomaly_type
 )
@@ -52,8 +52,6 @@ SELECT
     ch.channel_key,
 
     t.txn_id,
-    t.ticket_id,
-    t.seat_code,
     t.qty,
     t.list_price,
     t.discount_amount,

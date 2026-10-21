@@ -4,7 +4,7 @@
 -- Schema: cinema_dw
 --
 -- Hạt nhân:
---   fact_ticket : 1 hàng = 1 ghế / 1 vé
+--   fact_ticket : 1 hàng = 1 giao dịch x loại ghế
 --   fact_fnb    : 1 hàng = 1 dòng sản phẩm trong 1 giao dịch
 -- Cả hai fact đều có txn_id để nối vé ↔ bắp nước.
 -- =============================================================================
@@ -30,6 +30,7 @@ CREATE TABLE dim_date (
     day_name        VARCHAR(20) NOT NULL,
     is_weekend      BOOLEAN     NOT NULL,
     is_holiday      BOOLEAN     NOT NULL,
+    is_peak_day     BOOLEAN     NOT NULL DEFAULT FALSE,
     holiday_name    VARCHAR(80)
 );
 
@@ -151,9 +152,7 @@ CREATE TABLE fact_ticket (
     customer_key      INTEGER      NOT NULL REFERENCES dim_customer (customer_key),
     pricing_key       INTEGER      NOT NULL REFERENCES dim_pricing (pricing_key),
     channel_key       INTEGER      NOT NULL REFERENCES dim_channel (channel_key),
-    txn_id            VARCHAR(20)  NOT NULL,     -- degenerate: nối fact_fnb
-    ticket_id         VARCHAR(20)  NOT NULL UNIQUE,
-    seat_code         VARCHAR(10)  NOT NULL,
+    txn_id            VARCHAR(20)  NOT NULL UNIQUE,     -- degenerate: nối fact_fnb, 1 giao dịch x loại ghế = 1 dòng
     qty               SMALLINT     NOT NULL DEFAULT 1 CHECK (qty >= 0),
     list_price        NUMERIC(12, 0) NOT NULL,
     discount_amount   NUMERIC(12, 0) NOT NULL,
@@ -163,10 +162,9 @@ CREATE TABLE fact_ticket (
     loaded_at         TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-COMMENT ON TABLE fact_ticket IS 'Fact vé — grain 1 ghế. txn_id bắt buộc để đối soát F&B và POS.';
-COMMENT ON COLUMN fact_ticket.txn_id IS 'Mã giao dịch POS/APP/WEB, dùng JOIN fact_fnb.';
+COMMENT ON TABLE fact_ticket IS 'Fact vé — grain 1 giao dịch x loại ghế. txn_id duy nhất, nối fact_fnb và POS.';
+COMMENT ON COLUMN fact_ticket.txn_id IS 'Mã giao dịch POS/APP/WEB, UNIQUE, dùng JOIN fact_fnb.';
 
-CREATE INDEX idx_fact_ticket_txn    ON fact_ticket (txn_id);
 CREATE INDEX idx_fact_ticket_date   ON fact_ticket (date_key);
 CREATE INDEX idx_fact_ticket_movie  ON fact_ticket (movie_key);
 CREATE INDEX idx_fact_ticket_cinema ON fact_ticket (cinema_key);

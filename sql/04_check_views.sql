@@ -68,3 +68,12 @@ SELECT
 FROM vw_showtime_occupancy
 GROUP BY show_time, demand_group
 ORDER BY show_time, demand_group;
+
+-- (f) Tổng quan vw_anomaly_showtime: tỷ lệ suất có bất thường và vượt sức chứa
+SELECT 
+    'Check (f)' AS check_name,
+    COUNT(*) AS total_showtimes,
+    SUM(CASE WHEN is_anomaly_showtime THEN 1 ELSE 0 END) AS anomaly_showtimes,
+    ROUND((SUM(CASE WHEN is_anomaly_showtime THEN 1 ELSE 0 END)::NUMERIC / COUNT(*)) * 100, 2) AS anomaly_showtime_rate_pct,
+    COUNT(CASE WHEN occupancy_raw > 1.0 THEN 1 END) AS over_capacity_showtimes
+FROM vw_anomaly_showtime;

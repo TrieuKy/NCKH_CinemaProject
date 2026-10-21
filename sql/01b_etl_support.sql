@@ -20,7 +20,6 @@ CREATE SCHEMA IF NOT EXISTS staging;
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS staging.ticket (
     txn_id           TEXT,
-    ticket_id        TEXT,
     show_date        TEXT,        -- giữ dạng text để load nhanh, cast khi seed dim
     show_time        TEXT,
     cinema_id        TEXT,
@@ -44,7 +43,6 @@ CREATE TABLE IF NOT EXISTS staging.ticket (
     gender           TEXT,
     age_group        TEXT,
     membership_tier  TEXT,
-    seat_code        TEXT,
     channel_code     TEXT,
     ticket_format    TEXT,
     day_type         TEXT,

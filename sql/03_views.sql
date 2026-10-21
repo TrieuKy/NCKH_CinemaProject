@@ -143,47 +143,53 @@ COMMENT ON COLUMN cinema_dw.vw_fnb_attach.combo_attach_rate IS 'Tỷ lệ giao d
 
 
 -- =============================================================================
--- 4. vw_anomaly_rate (theo loại bất thường × rạp)
+-- 4. vw_anomaly_showtime (theo suất chiếu)
 -- =============================================================================
-CREATE OR REPLACE VIEW cinema_dw.vw_anomaly_rate AS
-WITH ticket_anom AS (
+CREATE OR REPLACE VIEW cinema_dw.vw_anomaly_showtime AS
+WITH showtime_anom AS (
     SELECT 
-        'Ticket' AS source_type, 
-        ft.cinema_key,
-        COALESCE(ft.anomaly_type, 'normal') AS anomaly_type,
-        COUNT(*) AS row_count, 
-        SUM(ft.net_amount) AS total_amount,
-        SUM(COUNT(*)) OVER (PARTITION BY ft.cinema_key) AS cinema_total_rows,
-        SUM(SUM(ft.net_amount)) OVER (PARTITION BY ft.cinema_key) AS cinema_total_amount
-    FROM cinema_dw.fact_ticket ft
-    GROUP BY ft.cinema_key, COALESCE(ft.anomaly_type, 'normal')
-),
-fnb_anom AS (
-    SELECT 
-        'F&B' AS source_type, 
-        ff.cinema_key,
-        COALESCE(ff.anomaly_type, 'normal') AS anomaly_type,
-        COUNT(*) AS row_count, 
-        SUM(ff.line_amount) AS total_amount,
-        SUM(COUNT(*)) OVER (PARTITION BY ff.cinema_key) AS cinema_total_rows,
-        SUM(SUM(ff.line_amount)) OVER (PARTITION BY ff.cinema_key) AS cinema_total_amount
-    FROM cinema_dw.fact_fnb ff
-    GROUP BY ff.cinema_key, COALESCE(ff.anomaly_type, 'normal')
-),
-combined AS (
-    SELECT * FROM ticket_anom
-    UNION ALL
-    SELECT * FROM fnb_anom
+        t.date_key,
+        t.time_key,
+        t.cinema_key,
+        t.room_key,
+        t.movie_key,
+        COUNT(DISTINCT t.txn_id)                                AS total_txns,
+        SUM(t.qty)                                              AS total_qty,
+        SUM(t.net_amount)                                       AS total_revenue,
+        COUNT(DISTINCT CASE WHEN t.is_anomaly = 1 THEN t.txn_id END) AS anom_txns,
+        SUM(CASE WHEN t.is_anomaly = 1 THEN t.qty ELSE 0 END)   AS anom_qty,
+        MAX(t.is_anomaly)                                       AS has_anomaly,
+        STRING_AGG(DISTINCT t.anomaly_type, ', ') FILTER (WHERE t.anomaly_type IS NOT NULL AND t.anomaly_type <> '') AS anomaly_types
+    FROM cinema_dw.fact_ticket t
+    GROUP BY t.date_key, t.time_key, t.cinema_key, t.room_key, t.movie_key
 )
 SELECT 
-    c.source_type,
+    s.date_key,
+    s.time_key,
+    s.room_key,
+    s.movie_key,
+    d.full_date,
+    tm.time_of_day,
     dc.cinema_name,
-    c.anomaly_type,
-    c.row_count,
-    c.total_amount,
-    ROUND((c.row_count::NUMERIC / c.cinema_total_rows) * 100, 2) AS pct_rows,
-    ROUND((c.total_amount::NUMERIC / c.cinema_total_amount) * 100, 2) AS pct_amount
-FROM combined c
-JOIN cinema_dw.dim_cinema dc ON c.cinema_key = dc.cinema_key;
+    dr.room_name,
+    dr.room_type,
+    dr.capacity,
+    dm.title AS movie_title,
+    s.total_txns,
+    s.total_qty,
+    s.total_revenue,
+    s.anom_txns,
+    s.anom_qty,
+    (s.has_anomaly = 1) AS is_anomaly_showtime,
+    COALESCE(s.anomaly_types, 'normal') AS anomaly_types,
+    ROUND((s.anom_txns::NUMERIC / NULLIF(s.total_txns, 0)) * 100, 2) AS anom_txn_rate_pct,
+    ROUND((s.total_qty::NUMERIC / dr.capacity), 4) AS occupancy_raw
+FROM showtime_anom s
+JOIN cinema_dw.dim_date d ON s.date_key = d.date_key
+JOIN cinema_dw.dim_time tm ON s.time_key = tm.time_key
+JOIN cinema_dw.dim_cinema dc ON s.cinema_key = dc.cinema_key
+JOIN cinema_dw.dim_room dr ON s.room_key = dr.room_key
+JOIN cinema_dw.dim_movie dm ON s.movie_key = dm.movie_key;
 
-COMMENT ON VIEW cinema_dw.vw_anomaly_rate IS 'Thống kê tỷ lệ các dòng dữ liệu bất thường và bình thường.';
+COMMENT ON VIEW cinema_dw.vw_anomaly_showtime IS 'Phát hiện bất thường mức suất chiếu (occupancy > 1, giá 0đ, lệch doanh thu).';
+COMMENT ON COLUMN cinema_dw.vw_anomaly_showtime.is_anomaly_showtime IS 'TRUE nếu suất có ít nhất 1 giao dịch bất thường hoặc vượt capacity.';
