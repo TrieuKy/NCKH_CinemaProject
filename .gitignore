@@ -1,0 +1,30 @@
+# ===== Bảo mật =====
+.env
+
+# ===== Môi trường Python =====
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# ===== Dữ liệu (không commit CSV lớn, chỉ commit generator) =====
+data/
+
+# ===== Log ETL =====
+logs/
+
+# ===== Rejects ETL =====
+data/rejects/
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.iml
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
