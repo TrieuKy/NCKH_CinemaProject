@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "deny": [
+      ".env",
+      "credentials.json",
+      ".venv/**",
+      "data/**",
+      "logs/**",
+      "**/__pycache__/**",
+      ".git/**"
+    ]
+  }
+}
