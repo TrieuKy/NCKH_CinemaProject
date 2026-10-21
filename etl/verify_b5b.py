@@ -42,12 +42,12 @@ queries_c = [
     ('tickets_sold âm', """
         INSERT INTO cinema_dw.fact_showtime_summary 
         (date_key, time_key, cinema_key, room_key, movie_key, tickets_sold, ticket_revenue, source)
-        VALUES (20250401, 1400, 1, 1, 1, -5, 100000, 'MANUAL');
+        VALUES (20251001, 1400, 1, 1, 1, -5, 100000, 'MANUAL');
     """),
     ('fnb_txns > ticket_txns', """
         INSERT INTO cinema_dw.fact_daily_cinema_summary 
         (date_key, cinema_key, ticket_txns, fnb_txns, fnb_revenue, source)
-        VALUES (20250401, 1, 100, 150, 5000000, 'MANUAL');
+        VALUES (20251001, 1, 100, 150, 5000000, 'MANUAL');
     """),
     ('trùng (date_key, time_key, room_key)', """
         INSERT INTO cinema_dw.fact_showtime_summary 
