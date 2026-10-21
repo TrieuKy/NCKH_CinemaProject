@@ -105,7 +105,6 @@ def load_staging() -> dict[str, int]:
         t0 = time.perf_counter()
         indexes_sql = """
             CREATE INDEX IF NOT EXISTS idx_stg_ticket_txn ON staging.ticket(txn_id);
-            CREATE INDEX IF NOT EXISTS idx_stg_ticket_id ON staging.ticket(ticket_id);
             CREATE INDEX IF NOT EXISTS idx_stg_ticket_cinema ON staging.ticket(cinema_id);
             CREATE INDEX IF NOT EXISTS idx_stg_ticket_room ON staging.ticket(room_id);
             CREATE INDEX IF NOT EXISTS idx_stg_ticket_movie ON staging.ticket(movie_id);
@@ -142,4 +141,15 @@ if __name__ == "__main__":
     for tbl, cnt in result.items():
         print(f"│ staging.{tbl:<12} │ {cnt:>12,} │")
     print("└─────────────────────┴──────────────┘")
+
+    if "--cleanup" in sys.argv:
+        logger.info("Cờ --cleanup được kích hoạt: Xóa file staging CSV...")
+        if TICKET_CSV.exists():
+            TICKET_CSV.unlink()
+            logger.info("Đã xóa %s", TICKET_CSV.name)
+        if FNB_CSV.exists():
+            FNB_CSV.unlink()
+            logger.info("Đã xóa %s", FNB_CSV.name)
+        print("  🧹 Đã xóa CSV staging theo cờ --cleanup.")
+
     sys.exit(0)

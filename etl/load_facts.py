@@ -36,7 +36,6 @@ REJECT_DIR.mkdir(parents=True, exist_ok=True)
 # --- Reject ticket: dòng nào LEFT JOIN ra NULL ở ít nhất 1 dim ---
 SQL_REJECT_TICKET = text("""
 SELECT
-    t.ticket_id,
     t.txn_id,
     t.show_date,
     t.show_time,

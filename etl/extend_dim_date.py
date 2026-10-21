@@ -2,17 +2,18 @@ import sys
 from datetime import date, timedelta
 from sqlalchemy import text
 from etl.db import get_engine, logger
-from core.holidays import get_holidays_range
+from core.holidays import get_holidays_range, get_peak_days_range
 
 def extend_dim_date():
     engine = get_engine()
-    logger.info("=== EXTEND DIM_DATE TO 2030 ===")
+    logger.info("=== EXTEND DIM_DATE TO 2027-12-31 ===")
     
-    # Generate all dates from 2025-04-01 to 2030-12-31
-    start_date = date(2025, 4, 1)
-    end_date = date(2030, 12, 31)
+    # Generate all dates from 2025-10-01 to 2027-12-31
+    start_date = date(2025, 10, 1)
+    end_date = date(2027, 12, 31)
     
-    all_holidays = get_holidays_range(2025, 2030)
+    all_holidays = get_holidays_range(2025, 2027)
+    all_peak_days = get_peak_days_range(2025, 2027)
     
     with engine.begin() as conn:
         d = start_date
@@ -30,19 +31,21 @@ def extend_dim_date():
             is_weekend = True if day_of_week >= 6 else False
             holiday_name = all_holidays.get(d)
             is_holiday = True if holiday_name else False
+            is_peak_day = True if d in all_peak_days else False
             
             sql = """
                 INSERT INTO cinema_dw.dim_date (
                     date_key, full_date, day_of_month, month_no, month_name, 
                     quarter_no, year_no, week_of_year, day_of_week, day_name, 
-                    is_weekend, is_holiday, holiday_name
+                    is_weekend, is_holiday, is_peak_day, holiday_name
                 ) VALUES (
                     :date_key, :full_date, :day_no, :month_no, :month_name,
                     :quarter_no, :year_no, :week_no, :day_of_week, :day_name,
-                    :is_weekend, :is_holiday, :holiday_name
+                    :is_weekend, :is_holiday, :is_peak_day, :holiday_name
                 )
                 ON CONFLICT (date_key) DO UPDATE SET
                     is_holiday = EXCLUDED.is_holiday,
+                    is_peak_day = EXCLUDED.is_peak_day,
                     holiday_name = EXCLUDED.holiday_name;
             """
             conn.execute(text(sql), {
@@ -50,7 +53,7 @@ def extend_dim_date():
                 "month_no": month_no, "month_name": month_name, "quarter_no": quarter_no,
                 "year_no": year_no, "week_no": week_no, "day_of_week": day_of_week,
                 "day_name": day_name, "is_weekend": is_weekend, "is_holiday": is_holiday,
-                "holiday_name": holiday_name
+                "is_peak_day": is_peak_day, "holiday_name": holiday_name
             })
             d += timedelta(days=1)
             

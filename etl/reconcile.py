@@ -34,7 +34,7 @@ def reconcile() -> bool:
 
     queries = []
 
-    # 1. Số dòng vé
+    # 1. Số dòng vé (số giao dịch)
     queries.append({
         "step": "reconcile_ticket_rows",
         "sql": """
@@ -48,7 +48,21 @@ def reconcile() -> bool:
         "msg": lambda r: "Khớp" if r[0] == r[1] else f"Lệch dòng vé: stg={r[0]}, fact={r[1]}"
     })
 
-    # 2. Tổng tiền vé
+    # 2. Tổng số vé quy đổi (SUM(qty))
+    queries.append({
+        "step": "reconcile_ticket_qty",
+        "sql": """
+            SELECT 
+                (SELECT COALESCE(SUM(qty), 0) FROM staging.ticket)::bigint AS src_rows,
+                (SELECT COALESCE(SUM(qty), 0) FROM cinema_dw.fact_ticket)::bigint AS dwh_rows,
+                NULL::numeric AS src_amount,
+                NULL::numeric AS dwh_amount
+        """,
+        "check": lambda r: "OK" if r[0] == r[1] else "FAIL",
+        "msg": lambda r: "Khớp" if r[0] == r[1] else f"Lệch tổng vé: stg={r[0]}, fact={r[1]}"
+    })
+
+    # 3. Tổng tiền vé
     queries.append({
         "step": "reconcile_ticket_amount",
         "sql": """
@@ -61,7 +75,7 @@ def reconcile() -> bool:
         "msg": lambda r: "Khớp" if abs(float(r[2] or 0) - float(r[3] or 0)) < 1 else f"Lệch tiền vé: stg={r[2]}, fact={r[3]}"
     })
 
-    # 3. Số dòng F&B
+    # 4. Số dòng F&B
     queries.append({
         "step": "reconcile_fnb_rows",
         "sql": """
@@ -74,7 +88,7 @@ def reconcile() -> bool:
         "msg": lambda r: "Khớp" if r[0] == r[1] else f"Lệch dòng F&B: stg={r[0]}, fact={r[1]}"
     })
 
-    # 4. Tổng tiền F&B
+    # 5. Tổng tiền F&B
     queries.append({
         "step": "reconcile_fnb_amount",
         "sql": """
@@ -87,7 +101,7 @@ def reconcile() -> bool:
         "msg": lambda r: "Khớp" if abs(float(r[2] or 0) - float(r[3] or 0)) < 1 else f"Lệch tiền F&B: stg={r[2]}, fact={r[3]}"
     })
 
-    # 5. F&B mồ côi (txn_id không thuộc vé nào)
+    # 6. F&B mồ côi (txn_id không thuộc vé nào)
     queries.append({
         "step": "qc_orphan_fnb",
         "sql": """
@@ -101,12 +115,12 @@ def reconcile() -> bool:
         "msg": lambda r: "Pass" if (r[0] or 0) == 0 else f"Lỗi: {r[0]} dòng F&B mồ côi"
     })
 
-    # 6. Suất vượt sức chứa mà is_anomaly = 0
+    # 7. Suất vượt sức chứa mà is_anomaly = 0
     queries.append({
         "step": "qc_capacity_breach_normal",
         "sql": """
             WITH counts AS (
-                SELECT room_id, show_date, show_time, capacity, COUNT(*) AS sold
+                SELECT room_id, show_date, show_time, capacity, SUM(qty) AS sold
                 FROM staging.ticket
                 WHERE is_anomaly = 0
                 GROUP BY room_id, show_date, show_time, capacity
@@ -119,35 +133,35 @@ def reconcile() -> bool:
         "msg": lambda r: "Pass" if (r[0] or 0) == 0 else f"Lỗi: {r[0]} suất bán lố ghế mà is_anomaly=0"
     })
 
-    # 7. ticket_id có ở staging mà thiếu ở fact
+    # 8. txn_id có ở staging mà thiếu ở fact
     queries.append({
         "step": "qc_stg_ticket_missing_in_fact",
         "sql": """
             SELECT 
                 (SELECT COUNT(*) FROM staging.ticket s 
-                 LEFT JOIN cinema_dw.fact_ticket f ON s.ticket_id = f.ticket_id 
-                 WHERE f.ticket_id IS NULL) AS src_rows,
+                 LEFT JOIN cinema_dw.fact_ticket f ON s.txn_id = f.txn_id 
+                 WHERE f.txn_id IS NULL) AS src_rows,
                 NULL::bigint, NULL::numeric, NULL::numeric
         """,
         "check": lambda r: "OK" if (r[0] or 0) == 0 else "FAIL",
-        "msg": lambda r: "Pass" if (r[0] or 0) == 0 else f"Lỗi: {r[0]} ticket_id có ở staging, thiếu ở fact"
+        "msg": lambda r: "Pass" if (r[0] or 0) == 0 else f"Lỗi: {r[0]} txn_id có ở staging, thiếu ở fact"
     })
 
-    # 8. ticket_id có ở fact mà thiếu ở staging
+    # 9. txn_id có ở fact mà thiếu ở staging
     queries.append({
         "step": "qc_fact_ticket_missing_in_stg",
         "sql": """
             SELECT 
                 (SELECT COUNT(*) FROM cinema_dw.fact_ticket f 
-                 LEFT JOIN staging.ticket s ON f.ticket_id = s.ticket_id 
-                 WHERE s.ticket_id IS NULL) AS src_rows,
+                 LEFT JOIN staging.ticket s ON f.txn_id = s.txn_id 
+                 WHERE s.txn_id IS NULL) AS src_rows,
                 NULL::bigint, NULL::numeric, NULL::numeric
         """,
         "check": lambda r: "OK" if (r[0] or 0) == 0 else "FAIL",
-        "msg": lambda r: "Pass" if (r[0] or 0) == 0 else f"Lỗi: {r[0]} ticket_id có ở fact, thiếu ở staging"
+        "msg": lambda r: "Pass" if (r[0] or 0) == 0 else f"Lỗi: {r[0]} txn_id có ở fact, thiếu ở staging"
     })
 
-    # 9. fnb_line_id thiếu ở fact
+    # 10. fnb_line_id thiếu ở fact
     queries.append({
         "step": "qc_stg_fnb_missing_in_fact",
         "sql": """
@@ -161,13 +175,13 @@ def reconcile() -> bool:
         "msg": lambda r: "Pass" if (r[0] or 0) == 0 else f"Lỗi: {r[0]} fnb_line_id có ở staging, thiếu ở fact"
     })
 
-    # 10. Số dòng vé có paid_amount staging khác net_amount fact
+    # 11. Số dòng vé có paid_amount staging khác net_amount fact
     queries.append({
         "step": "qc_ticket_amount_mismatch",
         "sql": """
             SELECT 
                 (SELECT COUNT(*) FROM staging.ticket s
-                 JOIN cinema_dw.fact_ticket f ON s.ticket_id = f.ticket_id
+                 JOIN cinema_dw.fact_ticket f ON s.txn_id = f.txn_id
                  WHERE abs(s.paid_amount - f.net_amount) >= 1) AS src_rows,
                 NULL::bigint, NULL::numeric, NULL::numeric
         """,

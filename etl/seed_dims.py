@@ -128,11 +128,11 @@ def print_counts() -> None:
     dim_counts = {r[0].split(".")[-1]: r[1] for r in rows}
 
     checks = [
-        ("dim_date",     548,   548,   "2025-04-01→2026-09-30 = 548 ngày"),
+        ("dim_date",     365,   365,   "2025-10-01→2026-09-30 = 365 ngày"),
         ("dim_time",    1440,  1440,   "1440 phút/ngày"),
         ("dim_cinema",     3,     3,   "3 rạp"),
         ("dim_room",       8,     8,   "8 phòng"),
-        ("dim_movie",     24,    24,   "24 phim"),
+        ("dim_movie",     15,    24,   "17–24 phim từ staging"),
         ("dim_channel",    3,     3,   "POS/APP/WEB"),
         ("dim_product",    8,     8,   "8 sản phẩm F&B"),
     ]
