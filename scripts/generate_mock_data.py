@@ -466,9 +466,10 @@ def inject_ticket_anomalies(tickets: pd.DataFrame) -> pd.DataFrame:
             extra = rec.to_dict()
             extra["txn_id"] = f"TXN9{seq:07d}"
             extra["qty"] = overflow
-            extra["paid_amount"] = int(extra["list_price"]) * overflow
-            extra["discount_amount"] = 0
-            extra["discount_rate"] = 0.0
+            unit_paid = int(rec["paid_amount"]) // int(rec["qty"])
+            unit_disc = int(rec["discount_amount"]) // int(rec["qty"])
+            extra["paid_amount"] = unit_paid * overflow
+            extra["discount_amount"] = unit_disc * overflow
             extra["is_anomaly"] = 1
             extra["anomaly_type"] = "qty_spike"
             extra_rows.append(extra)
