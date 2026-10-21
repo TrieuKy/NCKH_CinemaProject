@@ -117,7 +117,7 @@ def test_locked_row_cannot_be_updated(setup_db):
         conn.execute(text("""
             INSERT INTO cinema_dw.fact_showtime_summary (date_key, time_key, cinema_key, room_key, movie_key, tickets_sold, ticket_revenue, source, is_locked)
             VALUES (20251001, 1400, :ckey, :rkey, :mkey, 50, 5000000, 'MANUAL', TRUE)
-            ON CONFLICT (date_key, time_key, room_key) DO UPDATE SET tickets_sold = 50, is_locked = TRUE;
+            ON CONFLICT (date_key, time_key, room_key) DO UPDATE SET tickets_sold = 50, source = 'MANUAL', is_locked = TRUE;
         """), {"ckey": ckey, "rkey": rkey, "mkey": mkey})
     
     df = pd.DataFrame([
