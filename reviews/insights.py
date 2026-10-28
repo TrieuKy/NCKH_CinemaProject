@@ -57,7 +57,20 @@ ACTION_RULES_CATALOG: Dict[str, Dict[str, Any]] = {
     },
 }
 
-MIN_SAMPLE_DEFAULT = 10
+# ---------------------------------------------------------------------------
+# Hằng số ngưỡng phân loại mức độ ưu tiên
+# ---------------------------------------------------------------------------
+MIN_SAMPLE_DEFAULT         = 10
+
+THRESHOLD_URGENT_PCT       = 50.0  # Tiêu cực chủ đề >= 50%
+THRESHOLD_URGENT_MIN_N     = 10    # VÀ tối thiểu 10 lượt nhắc
+THRESHOLD_URGENT_DELTA_PCT = 10.0  # VÀ tăng >= 10 điểm % so với kỳ liền trước
+
+THRESHOLD_HIGH_PCT         = 40.0  # Tiêu cực chủ đề >= 40%
+THRESHOLD_HIGH_MIN_N       = 10    # VÀ tối thiểu 10 lượt nhắc
+
+THRESHOLD_MEDIUM_PCT       = 25.0  # Tiêu cực chủ đề >= 25%
+THRESHOLD_MEDIUM_MIN_N     = 5     # VÀ tối thiểu 5 lượt nhắc
 
 
 def _get_topics_series(df: pd.DataFrame) -> pd.Series:
@@ -171,12 +184,14 @@ def generate_operational_insights(
     if breakdown_df.empty:
         return []
 
-    # Phân tích kỳ trước nếu có
+    # Phân tích kỳ trước nếu có và đủ mẫu (n >= min_sample)
     prev_map: Dict[str, float] = {}
-    if prev_df is not None and not prev_df.empty:
+    if prev_df is not None and len(prev_df) >= min_sample:
         prev_breakdown = analyze_topic_breakdown(prev_df)
         for _, prow in prev_breakdown.iterrows():
-            prev_map[str(prow["topic"])] = float(prow["pct_negative"])
+            # Kỳ trước chỉ tính % tiêu cực nếu chủ đề có ít nhất THRESHOLD_MEDIUM_MIN_N lượt nhắc
+            if int(prow["n"]) >= THRESHOLD_MEDIUM_MIN_N:
+                prev_map[str(prow["topic"])] = float(prow["pct_negative"])
 
     insights = []
 
@@ -194,13 +209,19 @@ def generate_operational_insights(
         weight = float(rule.get("priority_weight", 1.0))
         severity_score = round((neg_count * 2.5 + pct_negative * 0.4) * weight, 2)
 
-        if neg_count >= 5 or pct_negative >= 35.0:
+        # Phân loại mức độ ưu tiên theo 4 mức chuẩn
+        if (
+            pct_negative >= THRESHOLD_URGENT_PCT
+            and n >= THRESHOLD_URGENT_MIN_N
+            and delta_pct_negative is not None
+            and delta_pct_negative >= THRESHOLD_URGENT_DELTA_PCT
+        ):
             priority_level = "KHẨN CẤP"
             badge_color = "#E50914"
-        elif neg_count >= 3 or pct_negative >= 20.0:
+        elif pct_negative >= THRESHOLD_HIGH_PCT and n >= THRESHOLD_HIGH_MIN_N:
             priority_level = "ƯU TIÊN CAO"
             badge_color = "#FF8C00"
-        elif neg_count >= 1 or pct_negative > 0:
+        elif pct_negative >= THRESHOLD_MEDIUM_PCT and n >= THRESHOLD_MEDIUM_MIN_N:
             priority_level = "TRUNG BÌNH"
             badge_color = "#F4C430"
         else:

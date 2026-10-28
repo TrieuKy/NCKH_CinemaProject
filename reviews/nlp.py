@@ -31,6 +31,13 @@ except Exception:
     _uts_sentiment = None
     _HAS_UNDERTHESEA = False
 
+DEFAULT_MODEL_VERSION = "lex-v1+uts" if _HAS_UNDERTHESEA else "lex-v1"
+
+
+def is_underthesea_active() -> bool:
+    """Trả về True nếu underthesea đã cài và đang hoạt động."""
+    return _HAS_UNDERTHESEA
+
 # ---------------------------------------------------------------------------
 # Từ điển mặc định — pipeline analyze.py tải lại từ DB để override
 # Bỏ từ quá chung: "rạp", "vé", "nước", "tối", "tiền"
@@ -304,7 +311,7 @@ def process_review(
     text: Optional[str],
     apify_lang: Optional[str] = None,
     topic_keywords: Optional[Dict[str, List[str]]] = None,
-    model_version: str = "v1",
+    model_version: str = DEFAULT_MODEL_VERSION,
 ) -> Dict:
     """
     Phân tích một đánh giá: trả dict sẵn sàng INSERT vào review_nlp.
@@ -330,7 +337,7 @@ def process_review(
 def process_batch(
     rows: List[Dict],
     topic_keywords: Optional[Dict[str, List[str]]] = None,
-    model_version: str = "v1",
+    model_version: str = DEFAULT_MODEL_VERSION,
 ) -> List[Dict]:
     """
     Xử lý danh sách đánh giá thô.

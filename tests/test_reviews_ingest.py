@@ -165,3 +165,44 @@ def test_ingest_missing_both_rating_and_text_skip(db_context):
     new, dup, skipped = save_raw_reviews(engine, rows, ckey, import_id)
     assert new == 0
     assert skipped == 1
+
+
+def test_ingest_content_update_resets_is_processed(db_context):
+    engine, ckey, prefix = db_context
+    import_id = create_import_log(engine, source=SOURCE_MANUAL, cinema_key=ckey, message=f"{prefix}run6")
+
+    rid = f"{prefix}edit_content"
+    rows = [{
+        "review_id": rid,
+        "rating": 5.0,
+        "review_text": "Lúc đầu đánh giá tốt",
+        "published_at": "2026-10-01",
+    }]
+    save_raw_reviews(engine, rows, ckey, import_id)
+
+    # Đánh dấu dòng là đã xử lý
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE cinema_dw.review_raw SET is_processed = TRUE WHERE review_id = :rid"),
+            {"rid": rid},
+        )
+
+    # Khách sửa lại nội dung đánh giá (đổi text và rating)
+    updated_rows = [{
+        "review_id": rid,
+        "rating": 1.0,
+        "review_text": "Sửa lại: dịch vụ tệ quá",
+        "published_at": "2026-10-01",
+    }]
+    save_raw_reviews(engine, updated_rows, ckey, import_id)
+
+    # is_processed phải được đặt lại thành FALSE để NLP pipeline tái phân tích
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT rating, review_text, is_processed FROM cinema_dw.review_raw WHERE review_id = :rid"),
+            {"rid": rid},
+        ).fetchone()
+        assert float(row[0]) == 1.0
+        assert row[1] == "Sửa lại: dịch vụ tệ quá"
+        assert row[2] is False
+

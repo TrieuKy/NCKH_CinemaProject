@@ -57,14 +57,54 @@ def test_insights_has_evidence():
 
 
 def test_insights_priority_urgent():
-    # neg_count >= 5 -> "KHẨN CẤP"
-    df = _create_sample_df(n_rows=20, neg_topic="Vệ sinh", neg_count=6)
-    insights = generate_operational_insights(df, min_sample=10)
+    # pct_neg >= 50%, n >= 10, delta >= 10% -> "KHẨN CẤP"
+    prev_df = _create_sample_df(n_rows=10, neg_topic="Vệ sinh", neg_count=2)  # 20%
+    curr_df = _create_sample_df(n_rows=10, neg_topic="Vệ sinh", neg_count=6)  # 60%
+    insights = generate_operational_insights(curr_df, prev_df=prev_df, min_sample=10)
     
     vesinh_ins = next((x for x in insights if x["topic"] == "Vệ sinh"), None)
     assert vesinh_ins is not None
     assert vesinh_ins["priority"] == "KHẨN CẤP"
     assert vesinh_ins["badge_color"] == "#E50914"
+
+
+def test_insights_no_prev_caps_at_high_priority():
+    # Khi không có kỳ trước (delta is None), dù pct_neg >= 50% thì tối đa chỉ đạt "ƯU TIÊN CAO"
+    curr_df = _create_sample_df(n_rows=10, neg_topic="Vệ sinh", neg_count=6)  # 60%
+    insights = generate_operational_insights(curr_df, prev_df=None, min_sample=10)
+    
+    vesinh_ins = next((x for x in insights if x["topic"] == "Vệ sinh"), None)
+    assert vesinh_ins is not None
+    assert vesinh_ins["priority"] == "ƯU TIÊN CAO"
+    assert vesinh_ins["badge_color"] == "#FF8C00"
+
+
+def test_insights_priority_medium():
+    # pct_neg >= 25% và n >= 5 -> "TRUNG BÌNH"
+    # Tổng df >= 10 dòng để đủ dữ liệu chạy insights, nhưng chủ đề Vệ sinh chỉ có 6 dòng (2 tiêu cực = 33.3%)
+    rows = []
+    for i in range(12):
+        if i < 6:
+            rows.append({
+                "review_id": f"rev_{i}",
+                "topics": ["Vệ sinh"],
+                "sentiment_final": "NEGATIVE" if i < 2 else "POSITIVE",
+                "rating": 1.0 if i < 2 else 5.0,
+            })
+        else:
+            rows.append({
+                "review_id": f"rev_{i}",
+                "topics": ["Hàng chờ & Bắp nước"],
+                "sentiment_final": "POSITIVE",
+                "rating": 5.0,
+            })
+    df = pd.DataFrame(rows)
+    insights = generate_operational_insights(df, min_sample=10)
+    vesinh_ins = next((x for x in insights if x["topic"] == "Vệ sinh"), None)
+    assert vesinh_ins is not None
+    assert vesinh_ins["n"] == 6
+    assert vesinh_ins["pct_negative"] == 33.3
+    assert vesinh_ins["priority"] == "TRUNG BÌNH"
 
 
 def test_insights_priority_maintain():

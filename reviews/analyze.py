@@ -23,12 +23,17 @@ from typing import Dict, List, Optional
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from reviews.nlp import DEFAULT_TOPIC_KEYWORDS, process_batch
+from reviews.nlp import (
+    DEFAULT_MODEL_VERSION,
+    DEFAULT_TOPIC_KEYWORDS,
+    is_underthesea_active,
+    process_batch,
+)
 
 logger = logging.getLogger("reviews.analyze")
 
-# Phiên bản model mặc định — tăng khi đổi từ điển hoặc thuật toán
-CURRENT_MODEL_VERSION = "v1"
+# Phiên bản model mặc định ("lex-v1+uts" hoặc "lex-v1")
+CURRENT_MODEL_VERSION = DEFAULT_MODEL_VERSION
 
 # Số dòng xử lý mỗi lần (tránh load toàn bộ vào RAM)
 BATCH_SIZE = 200
@@ -172,6 +177,11 @@ def process_unanalyzed(
     Xử lý tất cả dòng review_raw có is_processed=FALSE.
     Trả tổng số dòng đã phân tích.
     """
+    logger.info(
+        "Bắt đầu process_unanalyzed | model_version=%s | underthesea_active=%s",
+        model_version,
+        is_underthesea_active(),
+    )
     topic_dict = load_topic_dict(engine)
     if topic_dict is None:
         topic_dict = DEFAULT_TOPIC_KEYWORDS

@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS cinema_dw.review_source (
     google_place_id     VARCHAR(100),              -- NULL khi chưa có Place ID
     maps_url            TEXT,
     is_active           BOOLEAN  NOT NULL DEFAULT FALSE,
+    expected_keywords   TEXT[]   NOT NULL DEFAULT '{}', -- từ khóa đối soát địa điểm (không dấu, thường)
     note                TEXT,
     -- Khi is_active=TRUE, Place ID bắt buộc phải tồn tại
     CONSTRAINT ck_review_source_active_needs_place_id
@@ -59,11 +60,10 @@ CREATE TABLE IF NOT EXISTS cinema_dw.review_source (
 
 COMMENT ON TABLE cinema_dw.review_source IS
     'Một dòng / rạp. is_active=TRUE mới được crawler chọn. '
-    'CN02, CN03 để NULL và is_active=FALSE cho đến khi có Place ID.';
+    'expected_keywords dùng để đối soát địa chỉ Apify trả về.';
 
--- Seed: chỉ Landmark 81 (CN01) có Place ID và bật active
--- CN02, CN03: google_place_id=NULL, is_active=FALSE
-INSERT INTO cinema_dw.review_source (cinema_key, google_place_id, maps_url, is_active, note)
+-- Seed: Landmark 81 (CN01) có Place ID và bật active; CN02, CN03: google_place_id=NULL, is_active=FALSE
+INSERT INTO cinema_dw.review_source (cinema_key, google_place_id, maps_url, is_active, expected_keywords, note)
 SELECT
     c.cinema_key,
     CASE c.cinema_id
@@ -75,9 +75,18 @@ SELECT
         ELSE NULL
     END                         AS maps_url,
     (c.cinema_id = 'CN01')      AS is_active,
+    CASE c.cinema_id
+        WHEN 'CN01' THEN ARRAY['landmark', '81']
+        WHEN 'CN02' THEN ARRAY['dong khoi', 'vincom']
+        WHEN 'CN03' THEN ARRAY['pearl', 'plaza']
+        ELSE '{}'::TEXT[]
+    END                         AS expected_keywords,
     c.cinema_name               AS note
 FROM cinema_dw.dim_cinema c
-ON CONFLICT (cinema_key) DO NOTHING;
+ON CONFLICT (cinema_key) DO UPDATE SET
+    expected_keywords = EXCLUDED.expected_keywords,
+    google_place_id = COALESCE(cinema_dw.review_source.google_place_id, EXCLUDED.google_place_id),
+    maps_url = COALESCE(cinema_dw.review_source.maps_url, EXCLUDED.maps_url);
 
 -- =============================================================================
 -- 3. review_topic_dict — từ điển chủ đề (có thể sửa từ SQL hoặc UI)

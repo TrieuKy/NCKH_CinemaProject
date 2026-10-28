@@ -188,7 +188,19 @@ def save_raw_reviews(
         VALUES
             (:review_id, :import_id, :cinema_key, :rating, :review_text,
              :lang, :published_date, :likes_count)
-        ON CONFLICT (review_id) DO NOTHING
+        ON CONFLICT (review_id) DO UPDATE SET
+            review_text = EXCLUDED.review_text,
+            rating = EXCLUDED.rating,
+            likes_count = EXCLUDED.likes_count,
+            published_date = EXCLUDED.published_date,
+            lang = COALESCE(EXCLUDED.lang, cinema_dw.review_raw.lang),
+            is_processed = CASE
+                WHEN cinema_dw.review_raw.review_text IS DISTINCT FROM EXCLUDED.review_text
+                  OR cinema_dw.review_raw.rating IS DISTINCT FROM EXCLUDED.rating
+                THEN FALSE
+                ELSE cinema_dw.review_raw.is_processed
+            END
+        RETURNING (xmax = 0) AS is_inserted
     """)
 
     rows_new = rows_dup = rows_skipped = 0
@@ -231,7 +243,8 @@ def save_raw_reviews(
                 "likes_count":    int(r.get("likes_count") or 0),
             })
 
-            if result.rowcount > 0:
+            inserted = result.fetchone()[0]
+            if inserted:
                 rows_new += 1
             else:
                 rows_dup += 1
