@@ -4,3 +4,10 @@ sqlalchemy
 psycopg2-binary
 python-dotenv
 apscheduler
+pytest
+
+# Module Reviews (Phân tích đánh giá Google Maps)
+apify-client>=1.6.0
+# Tùy chọn nâng cao (NLP tiếng Việt sâu hơn & nhận diện ngôn ngữ):
+underthesea>=6.8.0
+langdetect>=1.0.9

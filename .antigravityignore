@@ -1,0 +1,12 @@
+.venv/
+data/
+logs/
+__pycache__/
+.pytest_cache/
+.git/
+legacy/
+*.csv
+*.db
+*.log
+docs/*.docx
+docs/UML/
