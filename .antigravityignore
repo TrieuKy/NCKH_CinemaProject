@@ -5,8 +5,15 @@ __pycache__/
 .pytest_cache/
 .git/
 legacy/
+cgv-analytics-project/
+reviews/src/
+cinema_analytics/
+TONG_QUAN_DU_AN.md
+docs/*.docx
+docs/UML/
+docs/phase-02-guide.md
+*.mdj
 *.csv
 *.db
 *.log
-docs/*.docx
-docs/UML/
+.env
