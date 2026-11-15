@@ -61,15 +61,18 @@ CREATE INDEX IF NOT EXISTS idx_model_metrics_name ON cinema_dw.model_metrics(mod
 
 COMMENT ON TABLE cinema_dw.model_metrics IS 'Lịch sử đánh giá chất lượng mô hình phân tích và dự báo.';
 
--- 4. forecast_result: Dự báo doanh thu/vé theo chuỗi thời gian (Prophet)
+-- 4. forecast_result: Dự báo doanh thu/vé theo chuỗi thời gian (Prophet / XGBoost / Baseline)
 CREATE TABLE IF NOT EXISTS cinema_dw.forecast_result (
     forecast_id       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     target_date       DATE NOT NULL,
     cinema_key        INTEGER REFERENCES cinema_dw.dim_cinema(cinema_key),
-    metric_type       VARCHAR(50) NOT NULL DEFAULT 'revenue',
+    time_slot         VARCHAR(50),
+    model_name        VARCHAR(50),
+    metric_type       VARCHAR(50) NOT NULL DEFAULT 'tickets',
     yhat              NUMERIC(15, 2) NOT NULL,
     yhat_lower        NUMERIC(15, 2),
     yhat_upper        NUMERIC(15, 2),
+    is_test           BOOLEAN NOT NULL DEFAULT TRUE,
     created_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
