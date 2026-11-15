@@ -55,8 +55,25 @@ Hệ số lấp đầy theo rạp: Landmark 81 ×1.08, Vincom Đồng Khởi ×1
 - **Khách vãng lai chiếm đa số: 70% giao dịch vé.**
 - Mọi khách vãng lai map về **một mã chuẩn**: `customer_id = 'GUEST'`, `customer_type = 'WALK_IN'`.
   - Lý do DA: không bịa RFM cho người không định danh; KPI “tỷ lệ thành viên” tính đúng.
-- Thành viên: `CUS000001` … `CUS002500`, `customer_type = 'MEMBER'`.
-  - Hạng: Standard 60%, Silver 30%, Gold 10%.
+- Thành viên: `CUS000001` … `CUS015000` (15.000 hội viên), `customer_type = 'MEMBER'`.
+  - Hạng: Standard, Silver, Gold phân bổ theo phân khúc tiềm ẩn.
+  - Ngày đăng ký (`register_date`): khách Mới lấy ngày giao dịch đầu tiên; các nhóm khác đặt trước ngày bắt đầu dữ liệu.
+
+### 2.3. Phân khúc tiềm ẩn của hội viên (Latent Segments) — Đánh giá Ground Truth (T1b)
+
+Để mô phỏng chân thực hành vi hội viên và đối chuẩn mô hình phân cụm K-Means, mỗi hội viên được gán một phân khúc tiềm ẩn (lưu tại `data/latent_labels.csv`, **không** đưa vào DWH).
+
+| Phân khúc tiềm ẩn | Tỷ lệ (%) | Tần suất/năm TB | Cửa sổ hoạt động | Thể loại ưa thích | Phòng ưa thích | Xác suất mua Combo |
+| :--- | :---: | :---: | :--- | :--- | :---: | :---: |
+| **VIP** | 8% | 30 | Cả năm (365 ngày) | 1–2 thể loại (60% lượt) | Ưa IMAX / 4DX | 55% |
+| **Trung thành** | 20% | 10 | Cả năm (365 ngày) | 1–2 thể loại (60% lượt) | Tiêu chuẩn | 35% |
+| **Thỉnh thoảng** | 40% | 3 | Cả năm (365 ngày) | 1–2 thể loại (60% lượt) | Tiêu chuẩn | 20% |
+| **Có nguy cơ rời bỏ** | 15% | 8 | Ngừng mua 60–150 ngày trước ngày cuối | 1–2 thể loại (60% lượt) | Tiêu chuẩn | 30% |
+| **Ngủ đông** | 10% | 5 | Ngừng mua > 180 ngày trước ngày cuối | 1–2 thể loại (60% lượt) | Tiêu chuẩn | 20% |
+| **Mới** | 7% | 4 | Gia nhập trong 60 ngày cuối | 1–2 thể loại (60% lượt) | Tiêu chuẩn | 25% |
+
+- Tần suất trung bình toàn bộ hội viên: $\approx 7.6 \approx 8$ lượt/năm.
+- Tỷ lệ giao dịch hội viên chiếm $\approx 30\%$ tổng số giao dịch (GUEST chiếm 70%).
 
 ---
 

@@ -70,3 +70,4 @@ if __name__ == "__main__":
     except Exception as exc:
         logger.exception("Lỗi khi chạy RFM pipeline: %s", exc)
         sys.exit(1)
+

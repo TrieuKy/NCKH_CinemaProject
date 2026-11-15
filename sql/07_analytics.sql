@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS cinema_dw.rfm_result (
     recency_days      INTEGER NOT NULL,
     frequency         INTEGER NOT NULL,
     monetary          NUMERIC(15, 2) NOT NULL,
+    tenure_days       INTEGER DEFAULT 0,
     r_score           SMALLINT,
     f_score           SMALLINT,
     m_score           SMALLINT,
@@ -37,6 +38,7 @@ CREATE TABLE IF NOT EXISTS cinema_dw.rfm_cluster_profile (
     avg_recency       NUMERIC(10, 2) NOT NULL,
     avg_frequency     NUMERIC(10, 2) NOT NULL,
     avg_monetary      NUMERIC(15, 2) NOT NULL,
+    avg_tenure        NUMERIC(10, 2) DEFAULT 0,
     top_genre         VARCHAR(100),
     combo_rate        NUMERIC(6, 4),
     updated_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -121,3 +123,4 @@ CREATE TABLE IF NOT EXISTS cinema_dw.whatif_run (
 );
 
 COMMENT ON TABLE cinema_dw.whatif_run IS 'Lịch sử chạy mô phỏng what-if với tham số params và kết quả result dạng JSONB.';
+

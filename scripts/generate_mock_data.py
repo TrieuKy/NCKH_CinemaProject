@@ -2,7 +2,7 @@
 Sinh dữ liệu thô (staging) cho Data Warehouse rạp chiếu.
 
 Quy luật: docs/assumptions.md
-Đầu ra: data/staging_ticket.csv , data/staging_fnb.csv
+Đầu ra: data/staging_ticket.csv, data/staging_fnb.csv, data/latent_labels.csv
 
 Chạy:
     python scripts/generate_mock_data.py
@@ -25,6 +25,7 @@ import pandas as pd
 from core.holidays import get_holidays_range, get_peak_days_range
 
 SEED = 42
+NUM_MEMBERS = 15000
 WALK_IN_RATE = 0.70
 ANOMALY_TXN_RATE = 0.015
 ANOMALY_FNB_RATE = 0.015
@@ -32,9 +33,7 @@ VOLUME_SCALE = 1.0
 START = date(2025, 10, 1)
 END = date(2026, 9, 30)
 
-ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
-
 RNG = np.random.default_rng(SEED)
 
 CINEMAS = [
@@ -102,6 +101,9 @@ MOVIES = [
     {"movie_id": "MV24", "title": "Đào, Phở và Piano", "genre": "Lịch sử", "language": "Tiếng Việt", "duration_min": 100, "rating": "T13", "release_date": date(2025, 12, 5), "country": "Việt Nam"},
 ]
 
+GENRES = sorted(list({m["genre"] for m in MOVIES}))
+GENRE_TO_IDX = {g: i for i, g in enumerate(GENRES)}
+
 PRODUCTS = [
     {"product_id": "P01", "product_name": "Bắp rang nhỏ", "product_category": "snack", "is_combo": False, "unit_price": 45000, "weight": 0.12},
     {"product_id": "P02", "product_name": "Bắp rang vừa", "product_category": "snack", "is_combo": False, "unit_price": 65000, "weight": 0.18},
@@ -148,11 +150,31 @@ SHOW_TIMES = [time(9, 30), time(11, 15), time(14, 0), time(16, 30), time(19, 0),
 PARTY_SIZES = np.array([1, 2, 3, 4])
 PARTY_PROBS = np.array([0.45, 0.35, 0.15, 0.05])
 TIERS = np.array(["Standard", "Silver", "Gold"])
-TIER_PROBS = np.array([0.60, 0.30, 0.10])
 GENDERS = np.array(["Nam", "Nữ", "Khác"])
 AGE_GROUPS = np.array(["13-17", "18-24", "25-34", "35-44", "45-54", "55+"])
 AGE_PROBS = np.array([0.08, 0.28, 0.30, 0.18, 0.10, 0.06])
 
+# ---------------------------------------------------------------------------
+# Cấu hình phân khúc tiềm ẩn (Latent Segments) cho 15.000 hội viên
+# ---------------------------------------------------------------------------
+LATENT_SEGMENTS = ["VIP", "Trung thành", "Thỉnh thoảng", "Có nguy cơ rời bỏ", "Ngủ đông", "Mới"]
+SEGMENT_PROBS = [0.08, 0.20, 0.40, 0.15, 0.10, 0.07]
+SEGMENT_FREQ_TARGET = {
+    "VIP": 30.0,
+    "Trung thành": 10.0,
+    "Thỉnh thoảng": 3.0,
+    "Có nguy cơ rời bỏ": 8.0,
+    "Ngủ đông": 5.0,
+    "Mới": 4.0,
+}
+SEGMENT_COMBO_PROB = {
+    "VIP": 0.55,
+    "Trung thành": 0.35,
+    "Thỉnh thoảng": 0.20,
+    "Có nguy cơ rời bỏ": 0.30,
+    "Ngủ đông": 0.20,
+    "Mới": 0.25,
+}
 
 HOLIDAYS: dict[date, str] = {}
 PEAK_DAYS: dict[date, str] = {}
@@ -189,7 +211,6 @@ def day_bucket(d: date) -> tuple[str, str, bool, str]:
     if d in HOLIDAYS:
         return "holiday", "holiday", is_weekend, HOLIDAYS[d]
     if d in PEAK_DAYS:
-        # Ngày cao điểm: áp giá holiday, đông khách, nhưng không phải lễ chính thức
         return "holiday", "holiday", is_weekend, ""
     if is_weekend:
         return "weekend", "weekend", True, ""
@@ -230,13 +251,12 @@ def occupancy(occ_bucket: str, slot: str, cinema_occ_mult: float, age_mult: floa
 
 
 def showtimes_for(d: date, room: dict, is_holiday: bool, is_weekend: bool) -> list[time]:
-    """Ít suất ngày thường, đủ suất cuối tuần/lễ/cao điểm — vẫn thể hiện quy luật hành vi."""
     busy = is_holiday or is_weekend or (d in PEAK_DAYS)
     if room["room_type"] == "IMAX":
         return SHOW_TIMES if busy else [time(14, 0), time(16, 30), time(19, 0), time(21, 15)]
     if busy:
         return [time(9, 30), time(14, 0), time(16, 30), time(19, 0), time(21, 15)]
-    if d.weekday() == 4:  # Thứ 6
+    if d.weekday() == 4:
         return [time(14, 0), time(16, 30), time(19, 0), time(21, 15)]
     return [time(14, 0), time(19, 0), time(21, 15)]
 
@@ -255,19 +275,94 @@ def ticket_money(list_price: int, slot: str, customer_type: str, tier: str | Non
     return rate, discount_amount, paid
 
 
-def build_members(n: int = 2500) -> list[dict]:
+def build_members(n: int = NUM_MEMBERS) -> tuple[list[dict], dict]:
+    """
+    Sinh n=15.000 hội viên với phân khúc tiềm ẩn, sở thích thể loại, phòng chiếu,
+    cửa sổ hoạt động và ngày đăng ký (register_date).
+    """
     members = []
-    for i in range(1, n + 1):
+    genre_matrix = np.ones((n, len(GENRES)), dtype=np.float32)
+    imax_weights = np.ones((n, 2), dtype=np.float32)
+    start_dates = []
+    end_dates = []
+    base_rates = []
+
+    for i in range(n):
+        seg = str(RNG.choice(LATENT_SEGMENTS, p=SEGMENT_PROBS))
+        target_f = SEGMENT_FREQ_TARGET[seg]
+
+        # Phân phối hạng thành viên theo phân khúc
+        if seg == "VIP":
+            tier = str(RNG.choice(TIERS, p=[0.10, 0.30, 0.60]))
+        elif seg == "Trung thành":
+            tier = str(RNG.choice(TIERS, p=[0.30, 0.50, 0.20]))
+        else:
+            tier = str(RNG.choice(TIERS, p=[0.75, 0.20, 0.05]))
+
+        # Cửa sổ hoạt động
+        if seg == "Có nguy cơ rời bỏ":
+            offset = RNG.integers(60, 151)
+            s_date = START
+            e_date = END - timedelta(days=int(offset))
+        elif seg == "Ngủ đông":
+            offset = RNG.integers(181, 301)
+            s_date = START
+            e_date = END - timedelta(days=int(offset))
+        elif seg == "Mới":
+            offset = RNG.integers(1, 61)
+            s_date = END - timedelta(days=int(offset))
+            e_date = END
+        else:
+            s_date = START
+            e_date = END
+
+        # 1-2 thể loại ưa thích (chọn khoảng 60% số lượt -> boost 6.0x)
+        num_fav = int(RNG.choice([1, 2], p=[0.5, 0.5]))
+        fav_idxs = RNG.choice(len(GENRES), size=num_fav, replace=False)
+        genre_matrix[i, fav_idxs] = 6.0
+
+        # Ưa chuộng phòng IMAX của VIP
+        if seg == "VIP":
+            imax_weights[i, 1] = 4.0
+        else:
+            imax_weights[i, 1] = 0.6
+
+        # Tần suất cơ sở hàng ngày khi đang hoạt động
+        L = max(1, (e_date - s_date).days + 1)
+        base_rate = target_f / L
+
+        start_dates.append(s_date)
+        end_dates.append(e_date)
+        base_rates.append(base_rate)
+
+        # Ngày đăng ký trước ngày bắt đầu hoạt động (đối với khách cũ)
+        reg_before = START - timedelta(days=int(RNG.integers(30, 730)))
+
         members.append(
             {
-                "customer_id": f"CUS{i:06d}",
+                "idx": i,
+                "customer_id": f"CUS{i+1:06d}",
                 "customer_type": "MEMBER",
                 "gender": str(RNG.choice(GENDERS, p=[0.48, 0.50, 0.02])),
                 "age_group": str(RNG.choice(AGE_GROUPS, p=AGE_PROBS)),
-                "membership_tier": str(RNG.choice(TIERS, p=TIER_PROBS)),
+                "membership_tier": tier,
+                "latent_segment": seg,
+                "target_f": target_f,
+                "s_date": s_date,
+                "e_date": e_date,
+                "fav_genres": [GENRES[idx] for idx in fav_idxs],
+                "reg_before": reg_before,
             }
         )
-    return members
+
+    meta = {
+        "start_dates": np.array(start_dates),
+        "end_dates": np.array(end_dates),
+        "base_rates": np.array(base_rates, dtype=np.float32),
+        "genre_matrix": genre_matrix,
+        "imax_weights": imax_weights,
+    }
+    return members, meta
 
 
 def channel_of(customer_type: str) -> str:
@@ -283,34 +378,74 @@ def fnb_buy_prob(slot: str, is_weekend: bool, is_holiday: bool) -> float:
     return min(base, 0.70)
 
 
-def pick_products(n_lines: int, slot: str, party: int) -> list[dict]:
-    weights = np.array([p["weight"] for p in PRODUCTS], dtype=float)
-    if slot in {"Tối", "Đêm"} or party >= 2:
-        weights = weights.copy()
-        for i, p in enumerate(PRODUCTS):
-            if p["is_combo"]:
-                weights[i] *= 1.6
-    weights = weights / weights.sum()
-    chosen_idx = RNG.choice(len(PRODUCTS), size=n_lines, replace=False, p=weights)
-    return [PRODUCTS[i] for i in chosen_idx]
+def pick_products(n_lines: int, slot: str, party: int, buy_combo: bool | None = None) -> list[dict]:
+    combos = [p for p in PRODUCTS if p["is_combo"]]
+    non_combos = [p for p in PRODUCTS if not p["is_combo"]]
+
+    if buy_combo is True:
+        # Bắt buộc có ít nhất 1 combo
+        first_prod = combos[int(RNG.integers(0, len(combos)))]
+        chosen = [first_prod]
+        if n_lines > 1:
+            rem_candidates = [p for p in PRODUCTS if p["product_id"] != first_prod["product_id"]]
+            w = np.array([p["weight"] for p in rem_candidates], dtype=float)
+            w /= w.sum()
+            extra = RNG.choice(rem_candidates, size=n_lines - 1, replace=False, p=w)
+            chosen.extend(extra)
+        return chosen
+    elif buy_combo is False:
+        # Không mua combo
+        w = np.array([p["weight"] for p in non_combos], dtype=float)
+        w /= w.sum()
+        chosen = RNG.choice(non_combos, size=min(n_lines, len(non_combos)), replace=False, p=w)
+        return list(chosen)
+    else:
+        # Mặc định theo trọng số thông thường (cho khách WALK_IN)
+        weights = np.array([p["weight"] for p in PRODUCTS], dtype=float)
+        if slot in {"Tối", "Đêm"} or party >= 2:
+            weights = weights.copy()
+            for i, p in enumerate(PRODUCTS):
+                if p["is_combo"]:
+                    weights[i] *= 1.6
+        weights = weights / weights.sum()
+        chosen_idx = RNG.choice(len(PRODUCTS), size=n_lines, replace=False, p=weights)
+        return [PRODUCTS[i] for i in chosen_idx]
 
 
-def generate() -> tuple[pd.DataFrame, pd.DataFrame]:
+def generate() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     build_holidays()
-    members = build_members()
+    members, member_meta = build_members(NUM_MEMBERS)
     cinema_by_id = {c["cinema_id"]: c for c in CINEMAS}
+
+    start_dates = member_meta["start_dates"]
+    end_dates = member_meta["end_dates"]
+    base_rates = member_meta["base_rates"]
+    genre_matrix = member_meta["genre_matrix"]
+    imax_weights = member_meta["imax_weights"]
+
+    member_first_txn: list[date | None] = [None] * NUM_MEMBERS
+    member_dict = {m["customer_id"]: m for m in members}
 
     ticket_rows: list[dict] = []
     txn_meta: list[dict] = []
 
     txn_seq = 1
 
-    print("Đang sinh suất chiếu và giao dịch vé...")
+    print("Đang sinh suất chiếu và giao dịch vé theo phân khúc tiềm ẩn...")
     for show_day in daterange(START, END):
         day_type, occ_bucket, is_weekend, holiday_name = day_bucket(show_day)
         is_holiday = bool(holiday_name)
+
+        # Tính mask hội viên đang hoạt động trong ngày
+        active_mask = (start_dates <= show_day) & (show_day <= end_dates)
+        day_base = base_rates * active_mask
+
+        day_cache: dict[tuple[int, int], np.ndarray] = {}
+
         for room in ROOMS:
             cinema = cinema_by_id[room["cinema_id"]]
+            is_imax = 1 if room["room_type"] == "IMAX" else 0
+
             for show_t in showtimes_for(show_day, room, is_holiday, is_weekend):
                 slot = time_slot_of(show_t)
                 catalog = movies_on(show_day, room["room_type"])
@@ -329,9 +464,38 @@ def generate() -> tuple[pd.DataFrame, pd.DataFrame]:
                 remaining = n_sold
                 list_price = LIST_PRICE[(room["room_type"], day_type)]
 
+                # Phân rã nhóm khách cho suất chiếu
+                parties: list[int] = []
+                walk_in_flags: list[bool] = []
                 while remaining > 0:
                     party = int(min(remaining, RNG.choice(PARTY_SIZES, p=PARTY_PROBS)))
-                    is_walk_in = RNG.random() < WALK_IN_RATE
+                    is_walk_in = bool(RNG.random() < WALK_IN_RATE)
+                    parties.append(party)
+                    walk_in_flags.append(is_walk_in)
+                    remaining -= party
+
+                # Lấy mẫu hội viên cho các giao dịch thành viên
+                n_member_txns = sum(1 for is_w in walk_in_flags if not is_w)
+                sampled_members: list[dict] = []
+                if n_member_txns > 0:
+                    g_idx = GENRE_TO_IDX.get(movie["genre"], 0)
+                    cache_key = (g_idx, is_imax)
+                    if cache_key not in day_cache:
+                        w = day_base * genre_matrix[:, g_idx] * imax_weights[:, is_imax]
+                        w_sum = w.sum()
+                        p = w / w_sum if w_sum > 0 else np.ones(NUM_MEMBERS) / NUM_MEMBERS
+                        day_cache[cache_key] = p
+                    else:
+                        p = day_cache[cache_key]
+
+                    sampled_cust_idxs = RNG.choice(NUM_MEMBERS, size=n_member_txns, p=p)
+                    for c_idx in sampled_cust_idxs:
+                        if member_first_txn[c_idx] is None:
+                            member_first_txn[c_idx] = show_day
+                        sampled_members.append(members[c_idx])
+
+                m_ptr = 0
+                for party, is_walk_in in zip(parties, walk_in_flags):
                     if is_walk_in:
                         cust = {
                             "customer_id": "GUEST",
@@ -339,15 +503,19 @@ def generate() -> tuple[pd.DataFrame, pd.DataFrame]:
                             "gender": "",
                             "age_group": "",
                             "membership_tier": "",
+                            "latent_segment": "",
                         }
                     else:
-                        cust = members[int(RNG.integers(0, len(members)))]
+                        cust = sampled_members[m_ptr]
+                        m_ptr += 1
+
                     channel = channel_of(cust["customer_type"])
                     rate, disc, paid = ticket_money(
                         list_price, slot, cust["customer_type"], cust["membership_tier"] or None
                     )
                     txn_id = f"TXN{txn_seq:08d}"
                     txn_seq += 1
+
                     txn_meta.append(
                         {
                             "txn_id": txn_id,
@@ -363,6 +531,7 @@ def generate() -> tuple[pd.DataFrame, pd.DataFrame]:
                             "is_holiday": is_holiday,
                         }
                     )
+
                     ticket_rows.append(
                         {
                             "txn_id": txn_id,
@@ -389,6 +558,7 @@ def generate() -> tuple[pd.DataFrame, pd.DataFrame]:
                             "gender": cust["gender"],
                             "age_group": cust["age_group"],
                             "membership_tier": cust["membership_tier"],
+                            "register_date": "",  # Sẽ cập nhật sau vòng lặp
                             "channel_code": channel,
                             "ticket_format": room["room_type"],
                             "day_type": day_type,
@@ -404,15 +574,35 @@ def generate() -> tuple[pd.DataFrame, pd.DataFrame]:
                             "anomaly_type": "",
                         }
                     )
-                    remaining -= party
+
+    # Cập nhật register_date cho hội viên
+    member_reg_dates: dict[str, str] = {}
+    for i, m in enumerate(members):
+        if m["latent_segment"] == "Mới":
+            reg_d = member_first_txn[i] if member_first_txn[i] is not None else m["s_date"]
+        else:
+            reg_d = m["reg_before"]
+        member_reg_dates[m["customer_id"]] = reg_d.isoformat()
+
+    for row in ticket_rows:
+        cid = row["customer_id"]
+        if cid != "GUEST":
+            row["register_date"] = member_reg_dates.get(cid, "")
 
     tickets = pd.DataFrame(ticket_rows)
     print(f"  Giao dịch vé bình thường: {len(tickets):,} dòng | Tổng vé: {tickets['qty'].sum():,}")
 
     tickets = inject_ticket_anomalies(tickets)
-    fnb = generate_fnb(txn_meta)
+    fnb = generate_fnb(txn_meta, member_dict)
     fnb = inject_fnb_anomalies(fnb)
-    return tickets, fnb
+
+    # DataFrame nhãn tiềm ẩn để đánh giá
+    latent_df = pd.DataFrame([
+        {"customer_id": m["customer_id"], "latent_segment": m["latent_segment"]}
+        for m in members
+    ])
+
+    return tickets, fnb, latent_df
 
 
 def inject_ticket_anomalies(tickets: pd.DataFrame) -> pd.DataFrame:
@@ -439,11 +629,9 @@ def inject_ticket_anomalies(tickets: pd.DataFrame) -> pd.DataFrame:
     mismatch_idx = tickets.index[mismatch_mask].to_numpy()
     if len(mismatch_idx):
         half = RNG.random(len(mismatch_idx)) < 0.5
-        # Nửa đầu: thu theo giá niêm yết nguyên giá (bỏ qua chiết khấu)
         tickets.loc[mismatch_idx[half], "paid_amount"] = (
             tickets.loc[mismatch_idx[half], "list_price"].to_numpy() * tickets.loc[mismatch_idx[half], "qty"].to_numpy()
         )
-        # Nửa sau: thu gấp đôi
         tickets.loc[mismatch_idx[~half], "paid_amount"] = (
             tickets.loc[mismatch_idx[~half], "paid_amount"].to_numpy() * 2
         )
@@ -461,7 +649,6 @@ def inject_ticket_anomalies(tickets: pd.DataFrame) -> pd.DataFrame:
         for _, rec in templates.iterrows():
             already = int(show_totals.loc[(rec["room_id"], rec["show_date"], rec["show_time"])])
             cap = int(rec["capacity"])
-            # Số vé overflow để tổng số vé trong suất vượt sức chứa phòng
             overflow = max(5, cap - already + int(round(cap * 0.08)))
             extra = rec.to_dict()
             extra["txn_id"] = f"TXN9{seq:07d}"
@@ -480,15 +667,25 @@ def inject_ticket_anomalies(tickets: pd.DataFrame) -> pd.DataFrame:
     return tickets
 
 
-def generate_fnb(txn_meta: list[dict]) -> pd.DataFrame:
-    print("Đang sinh bắp nước...")
+def generate_fnb(txn_meta: list[dict], member_dict: dict) -> pd.DataFrame:
+    print("Đang sinh bắp nước theo xác suất combo của phân khúc...")
     rows: list[dict] = []
     line_seq = 1
     for meta in txn_meta:
         if RNG.random() > fnb_buy_prob(meta["slot"], meta["is_weekend"], meta["is_holiday"]):
             continue
         n_lines = int(RNG.choice([1, 2, 3], p=[0.55, 0.35, 0.10]))
-        products = pick_products(n_lines, meta["slot"], meta["party"])
+
+        # Xác định mua combo theo phân khúc tiềm ẩn
+        if meta["customer_type"] == "MEMBER":
+            member = member_dict.get(meta["customer_id"])
+            seg = member["latent_segment"] if member else "Thỉnh thoảng"
+            combo_prob = SEGMENT_COMBO_PROB[seg]
+            buy_combo = bool(RNG.random() < combo_prob)
+        else:
+            buy_combo = None  # Khách WALK_IN
+
+        products = pick_products(n_lines, meta["slot"], meta["party"], buy_combo=buy_combo)
         for prod in products:
             qty = int(RNG.choice([1, 2], p=[0.78, 0.22]))
             unit = int(prod["unit_price"])
@@ -547,7 +744,6 @@ def validate(tickets: pd.DataFrame, fnb: pd.DataFrame) -> None:
     anom_f = (fnb["is_anomaly"] == 1).mean() if n_f else 0
     orphan = ~fnb["txn_id"].isin(tickets["txn_id"]) if n_f else pd.Series(dtype=bool)
 
-    # Kiểm tra vượt sức chứa ngoài các suất được chủ đích gieo qty_spike
     spike_mask = tickets["anomaly_type"].eq("qty_spike")
     non_spike = tickets[~spike_mask]
     sold_vs_cap = (
@@ -576,15 +772,20 @@ def validate(tickets: pd.DataFrame, fnb: pd.DataFrame) -> None:
 
 def main() -> int:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    tickets, fnb = generate()
+    tickets, fnb, latent_df = generate()
     validate(tickets, fnb)
 
     ticket_path = DATA_DIR / "staging_ticket.csv"
     fnb_path = DATA_DIR / "staging_fnb.csv"
+    latent_path = DATA_DIR / "latent_labels.csv"
+
     tickets.to_csv(ticket_path, index=False, encoding="utf-8", quoting=csv.QUOTE_MINIMAL)
     fnb.to_csv(fnb_path, index=False, encoding="utf-8", quoting=csv.QUOTE_MINIMAL)
+    latent_df.to_csv(latent_path, index=False, encoding="utf-8")
+
     print(f"Đã ghi {ticket_path} ({ticket_path.stat().st_size / 1e6:.1f} MB)")
     print(f"Đã ghi {fnb_path} ({fnb_path.stat().st_size / 1e6:.1f} MB)")
+    print(f"Đã ghi {latent_path} ({len(latent_df):,} hội viên)")
     return 0
 
 

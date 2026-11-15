@@ -7,15 +7,18 @@ Phân khúc khách hàng thành viên dựa trên RFM và thuật toán K-Means:
    - Recency (R): Số ngày từ lần mua cuối cùng đến ngày sau cùng của dữ liệu.
    - Frequency (F): Số giao dịch (txn_id) khác nhau.
    - Monetary (M): Tổng net_amount (vé) + line_amount (bắp nước).
+   - Tenure: Số ngày từ giao dịch đầu tiên đến giao dịch cuối cùng của khách hàng.
 3. Tiền xử lý:
-   - np.log1p + StandardScaler.
+   - np.log1p + StandardScaler trên [recency_days, frequency, monetary, tenure].
 4. Phân cụm K-Means:
-   - Thử nghiệm k = 3..6.
-   - Đánh giá và chọn k tối ưu theo Silhouette Score (in kèm Inertia).
-5. Gán nhãn cụm theo luật xếp hạng tâm cụm:
-   - (VIP, Trung thành, Có nguy cơ rời bỏ, Mới, Ngủ đông).
+   - Đánh giá k = 3..6 theo Silhouette Score và Inertia.
+5. Gán tên cụm bằng quy tắc kết hợp thứ hạng và ngưỡng tuyệt đối:
+   - Ngủ đông khi R > 180;
+   - Có nguy cơ rời bỏ khi R từ 60 đến 180;
+   - Mới khi tenure <= 60;
+   - Còn lại chia VIP / Trung thành / Thỉnh thoảng theo F và M.
 6. Hồ sơ cụm (Cluster Profile):
-   - Số lượng khách, tỷ lệ %, R/F/M trung bình.
+   - Số lượng khách, tỷ lệ %, R/F/M/Tenure trung bình.
    - Thể loại xem nhiều nhất (top_genre).
    - Tỷ lệ mua combo (combo_rate).
 """
@@ -95,17 +98,18 @@ def compute_rfm_metrics(
     reference_date: Optional[date | datetime | str] = None,
 ) -> pd.DataFrame:
     """
-    Tính R, F, M cho từng khách hàng:
+    Tính R, F, M, Tenure cho từng khách hàng:
     - Bỏ dòng is_anomaly = 1.
     - Lọc is_guest = FALSE nếu có cột is_guest.
     - R: số ngày từ lần mua cuối đến ngày sau cùng của dữ liệu.
     - F: số txn_id khác nhau.
     - M: net_amount vé + line_amount bắp nước.
+    - Tenure: số ngày từ giao dịch đầu tiên đến giao dịch cuối cùng.
     """
     if df_tickets.empty:
-        return pd.DataFrame(columns=["customer_key", "customer_id", "recency_days", "frequency", "monetary"])
+        return pd.DataFrame(columns=["customer_key", "customer_id", "recency_days", "frequency", "monetary", "tenure"])
 
-    # Lọc bỏ bất thường nếu có cột is_anomaly
+    # Lọc bỏ bất thường
     t_clean = df_tickets.copy()
     if "is_anomaly" in t_clean.columns:
         t_clean = t_clean[t_clean["is_anomaly"] == 0]
@@ -120,12 +124,11 @@ def compute_rfm_metrics(
         if "is_guest" in f_clean.columns:
             f_clean = f_clean[f_clean["is_guest"] == False]  # noqa: E712
 
-    # Chuyển full_date sang datetime
     t_clean["full_date"] = pd.to_datetime(t_clean["full_date"])
     if not f_clean.empty and "full_date" in f_clean.columns:
         f_clean["full_date"] = pd.to_datetime(f_clean["full_date"])
 
-    # Xác định ngày sau cùng của dữ liệu (reference_date)
+    # Xác định ngày sau cùng của dữ liệu
     if reference_date is None:
         t_max = t_clean["full_date"].max() if not t_clean.empty else pd.to_datetime("now")
         f_max = f_clean["full_date"].max() if not f_clean.empty and "full_date" in f_clean.columns else t_max
@@ -133,9 +136,10 @@ def compute_rfm_metrics(
     else:
         ref_dt = pd.to_datetime(reference_date)
 
-    # Tính theo vé
+    # Tính theo vé: ngày đầu, ngày cuối, giao dịch, số tiền
     ticket_group = t_clean.groupby("customer_key").agg(
         customer_id=("customer_id", "first") if "customer_id" in t_clean.columns else ("customer_key", lambda x: f"CUS{x.iloc[0]}"),
+        first_ticket_date=("full_date", "min"),
         last_ticket_date=("full_date", "max"),
         ticket_txns=("txn_id", lambda s: set(s.dropna().unique())),
         ticket_net_amount=("net_amount", "sum"),
@@ -144,25 +148,32 @@ def compute_rfm_metrics(
     # Tính theo F&B
     if not f_clean.empty:
         fnb_group = f_clean.groupby("customer_key").agg(
+            customer_id=("customer_id", "first") if "customer_id" in f_clean.columns else ("customer_key", lambda x: f"CUS{x.iloc[0]}"),
+            first_fnb_date=("full_date", "min") if "full_date" in f_clean.columns else ("customer_key", lambda _: pd.NaT),
             last_fnb_date=("full_date", "max") if "full_date" in f_clean.columns else ("customer_key", lambda _: pd.NaT),
             fnb_txns=("txn_id", lambda s: set(s.dropna().unique())),
             fnb_line_amount=("line_amount", "sum"),
         ).reset_index()
-        merged = pd.merge(ticket_group, fnb_group, on="customer_key", how="outer")
+        merged = pd.merge(ticket_group, fnb_group, on="customer_key", how="outer", suffixes=("_t", "_f"))
+        merged["customer_id"] = merged["customer_id_t"].combine_first(merged["customer_id_f"])
+        merged.drop(columns=["customer_id_t", "customer_id_f"], inplace=True)
     else:
         merged = ticket_group.copy()
+        merged["first_fnb_date"] = pd.NaT
         merged["last_fnb_date"] = pd.NaT
         merged["fnb_txns"] = [set() for _ in range(len(merged))]
         merged["fnb_line_amount"] = 0.0
 
-    # Điền giá trị khuyết
     merged["ticket_txns"] = merged["ticket_txns"].apply(lambda x: x if isinstance(x, set) else set())
     merged["fnb_txns"] = merged["fnb_txns"].apply(lambda x: x if isinstance(x, set) else set())
     merged["ticket_net_amount"] = merged["ticket_net_amount"].fillna(0.0)
     merged["fnb_line_amount"] = merged["fnb_line_amount"].fillna(0.0)
 
-    # 1. R: Số ngày từ lần mua cuối cùng
+    # Ngày đầu và ngày cuối
+    merged["first_purchase_date"] = merged[["first_ticket_date", "first_fnb_date"]].min(axis=1)
     merged["last_purchase_date"] = merged[["last_ticket_date", "last_fnb_date"]].max(axis=1)
+
+    # 1. R: Số ngày từ lần mua cuối cùng đến mốc ref_dt
     merged["recency_days"] = (ref_dt - merged["last_purchase_date"]).dt.days.fillna(0).astype(int)
 
     # 2. F: Số txn_id khác nhau
@@ -172,11 +183,15 @@ def compute_rfm_metrics(
     # 3. M: net_amount vé + line_amount bắp nước
     merged["monetary"] = (merged["ticket_net_amount"] + merged["fnb_line_amount"]).round(2)
 
-    # Đảm bảo có customer_id
-    if "customer_id" not in merged.columns or merged["customer_id"].isnull().any():
-        merged["customer_id"] = merged["customer_key"].apply(lambda k: f"CUS_{k}")
+    # 4. Tenure: Số ngày từ giao dịch đầu tiên đến giao dịch cuối cùng
+    merged["tenure"] = (merged["last_purchase_date"] - merged["first_purchase_date"]).dt.days.fillna(0).astype(int)
 
-    # Điểm số R, F, M (1..5) phục vụ phân tích phụ
+    if "customer_id" not in merged.columns or merged["customer_id"].isnull().all():
+        merged["customer_id"] = merged["customer_key"].apply(lambda k: f"CUS_{k}")
+    else:
+        merged["customer_id"] = merged["customer_id"].fillna(merged["customer_key"].apply(lambda k: f"CUS_{k}"))
+
+    # Điểm số R, F, M (1..5)
     try:
         merged["r_score"] = pd.qcut(merged["recency_days"].rank(method="first"), q=5, labels=[5, 4, 3, 2, 1]).astype(int)
         merged["f_score"] = pd.qcut(merged["frequency"].rank(method="first"), q=5, labels=[1, 2, 3, 4, 5]).astype(int)
@@ -190,7 +205,7 @@ def compute_rfm_metrics(
 
     result_cols = [
         "customer_key", "customer_id", "recency_days", "frequency", "monetary",
-        "r_score", "f_score", "m_score", "rfm_score"
+        "tenure", "r_score", "f_score", "m_score", "rfm_score"
     ]
     return merged[result_cols].sort_values("customer_key").reset_index(drop=True)
 
@@ -201,20 +216,15 @@ def evaluate_kmeans_candidates(
     random_state: int = 42,
 ) -> Tuple[int, Dict[int, Dict[str, float]], np.ndarray]:
     """
-    Thực hiện tiền xử lý log1p + StandardScaler và đánh giá k = 3..6 theo Silhouette Score & Inertia.
-    Trả về:
-    - best_k: Giá trị k có silhouette score cao nhất.
-    - metrics: Dictionary chứa inertia và silhouette score của từng k.
-    - X_scaled: Mảng dữ liệu đã chuẩn hóa.
+    Tiền xử lý log1p + StandardScaler trên [recency_days, frequency, monetary, tenure]
+    và đánh giá k theo Silhouette Score & Inertia.
     """
     if len(df_rfm) < max(k_range):
         raise ValueError(f"Số lượng khách hàng ({len(df_rfm)}) nhỏ hơn k tối đa ({max(k_range)}).")
 
-    # 1. log1p transformation
-    features = df_rfm[["recency_days", "frequency", "monetary"]].copy()
+    features = df_rfm[["recency_days", "frequency", "monetary", "tenure"]].copy()
     X_log = np.log1p(features.values)
 
-    # 2. StandardScaler
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_log)
 
@@ -242,49 +252,49 @@ def evaluate_kmeans_candidates(
 
 def assign_cluster_names(centroids_df: pd.DataFrame) -> Dict[int, str]:
     """
-    Đặt tên cụm bằng luật theo xếp hạng tâm cụm (VIP, Trung thành, Có nguy cơ rời bỏ, Mới, Ngủ đông):
-    - VIP: Cụm có Monetary cao nhất (kèm Frequency cao, Recency thấp).
-    - Ngủ đông: Cụm có Monetary thấp nhất (kèm Frequency thấp, Recency cao).
-    - Có nguy cơ rời bỏ: Trong các cụm còn lại, cụm có Recency cao nhất (đã lâu chưa quay lại).
-    - Trung thành: Cụm có Recency thấp, Frequency cao.
-    - Mới: Cụm có Recency thấp, Frequency/Monetary thấp hơn.
+    Gán tên cụm bằng quy tắc kết hợp thứ hạng và ngưỡng tuyệt đối:
+    - Ngủ đông khi R > 180;
+    - Có nguy cơ rời bỏ khi R từ 60 đến 180;
+    - Mới khi tenure <= 60;
+    - Còn lại chia VIP / Trung thành / Thỉnh thoảng theo F và M.
     """
     labels: Dict[int, str] = {}
     remaining = list(centroids_df.index)
 
-    # 1. VIP: Monetary cao nhất
-    vip_id = int(centroids_df.loc[remaining, "monetary"].idxmax())
-    labels[vip_id] = "VIP"
-    remaining.remove(vip_id)
+    # 1. Ngủ đông: R > 180
+    dormant_candidates = [cid for cid in remaining if centroids_df.loc[cid, "recency_days"] > 180]
+    if dormant_candidates:
+        best_dormant = max(dormant_candidates, key=lambda c: centroids_df.loc[c, "recency_days"])
+        labels[best_dormant] = "Ngủ đông"
+        remaining.remove(best_dormant)
 
-    # 2. Ngủ đông: Monetary thấp nhất trong các cụm còn lại
-    dormant_id = int(centroids_df.loc[remaining, "monetary"].idxmin())
-    labels[dormant_id] = "Ngủ đông"
-    remaining.remove(dormant_id)
+    # 2. Có nguy cơ rời bỏ: 60 <= R <= 180
+    at_risk_candidates = [cid for cid in remaining if 60 <= centroids_df.loc[cid, "recency_days"] <= 180]
+    if at_risk_candidates:
+        best_at_risk = max(at_risk_candidates, key=lambda c: centroids_df.loc[c, "recency_days"])
+        labels[best_at_risk] = "Có nguy cơ rời bỏ"
+        remaining.remove(best_at_risk)
 
-    if not remaining:
-        return labels
+    # 3. Mới: tenure <= 60
+    new_candidates = [cid for cid in remaining if centroids_df.loc[cid, "tenure"] <= 60]
+    if new_candidates:
+        best_new = min(new_candidates, key=lambda c: centroids_df.loc[c, "tenure"])
+        labels[best_new] = "Mới"
+        remaining.remove(best_new)
 
-    # 3. Có nguy cơ rời bỏ: Recency cao nhất trong các cụm còn lại
-    at_risk_id = int(centroids_df.loc[remaining, "recency_days"].idxmax())
-    labels[at_risk_id] = "Có nguy cơ rời bỏ"
-    remaining.remove(at_risk_id)
-
-    if not remaining:
-        return labels
-
-    if len(remaining) == 1:
-        # Nếu chỉ còn 1 cụm (k=4)
-        labels[remaining[0]] = "Trung thành"
-        return labels
-
-    # Nếu còn >= 2 cụm (k=5 hoặc k=6): cụm có Frequency cao nhất là Trung thành, còn lại là Mới
-    loyal_id = int(centroids_df.loc[remaining, "frequency"].idxmax())
-    labels[loyal_id] = "Trung thành"
-    remaining.remove(loyal_id)
-
-    for rem_id in remaining:
-        labels[rem_id] = "Mới"
+    # 4. Các cụm còn lại: chia VIP / Trung thành / Thỉnh thoảng theo thứ hạng F và M
+    if remaining:
+        ranked = sorted(
+            remaining,
+            key=lambda c: (centroids_df.loc[c, "frequency"], centroids_df.loc[c, "monetary"]),
+            reverse=True,
+        )
+        active_names = ["VIP", "Trung thành", "Thỉnh thoảng"]
+        for idx, cid in enumerate(ranked):
+            if idx < len(active_names):
+                labels[cid] = active_names[idx]
+            else:
+                labels[cid] = "Thỉnh thoảng"
 
     return labels
 
@@ -296,7 +306,7 @@ def cluster_rfm_customers(
     random_state: int = 42,
 ) -> Tuple[pd.DataFrame, Dict[int, str]]:
     """
-    Chạy K-Means với k đã chọn và gán nhãn luật ngữ nghĩa cho từng cụm.
+    Chạy K-Means với k đã chọn và gán nhãn theo quy tắc kết hợp thứ hạng và ngưỡng tuyệt đối.
     """
     km = KMeans(n_clusters=k, random_state=random_state, n_init=10)
     cluster_ids = km.fit_predict(X_scaled)
@@ -304,8 +314,8 @@ def cluster_rfm_customers(
     df_result = df_rfm.copy()
     df_result["cluster_id"] = cluster_ids
 
-    # Tính tâm cụm trung bình trên không gian giá trị gốc R, F, M
-    centroids = df_result.groupby("cluster_id")[["recency_days", "frequency", "monetary"]].mean()
+    # Tính tâm cụm trên R, F, M, tenure gốc
+    centroids = df_result.groupby("cluster_id")[["recency_days", "frequency", "monetary", "tenure"]].mean()
     label_map = assign_cluster_names(centroids)
 
     df_result["cluster_name"] = df_result["cluster_id"].map(label_map)
@@ -321,38 +331,39 @@ def build_cluster_profiles(
     Xây dựng hồ sơ chân dung cụm:
     - cluster_id, cluster_name
     - customer_count, pct_customers
-    - avg_recency, avg_frequency, avg_monetary
+    - avg_recency, avg_frequency, avg_monetary, avg_tenure
     - top_genre: Thể loại phim xem nhiều nhất của cụm
     - combo_rate: Tỷ lệ mua combo của cụm (số giao dịch mua combo / tổng giao dịch vé)
     """
     total_cust = len(df_rfm_clustered)
 
-    # 1. Thống kê cơ bản từ RFM
     profile_df = df_rfm_clustered.groupby(["cluster_id", "cluster_name"]).agg(
         customer_count=("customer_key", "count"),
         avg_recency=("recency_days", "mean"),
         avg_frequency=("frequency", "mean"),
         avg_monetary=("monetary", "mean"),
+        avg_tenure=("tenure", "mean"),
     ).reset_index()
 
     profile_df["pct_customers"] = ((profile_df["customer_count"] / total_cust) * 100.0).round(2)
     profile_df["avg_recency"] = profile_df["avg_recency"].round(2)
     profile_df["avg_frequency"] = profile_df["avg_frequency"].round(2)
     profile_df["avg_monetary"] = profile_df["avg_monetary"].round(2)
+    profile_df["avg_tenure"] = profile_df["avg_tenure"].round(2)
 
-    # 2. Xác định thể loại xem nhiều nhất (top_genre)
+    # Xác định top_genre
     top_genres: Dict[int, str] = {}
     total_ticket_txns_by_cluster: Dict[int, int] = {}
     if df_tickets is not None and not df_tickets.empty and "genre" in df_tickets.columns:
         t_clean = df_tickets[df_tickets["is_anomaly"] == 0] if "is_anomaly" in df_tickets.columns else df_tickets
         t_merged = pd.merge(t_clean, df_rfm_clustered[["customer_key", "cluster_id"]], on="customer_key")
-        
+
         for cid, group in t_merged.groupby("cluster_id"):
             genre_mode = group["genre"].mode()
             top_genres[cid] = str(genre_mode.iloc[0]) if not genre_mode.empty else "N/A"
             total_ticket_txns_by_cluster[cid] = group["txn_id"].nunique()
 
-    # 3. Tính tỷ lệ mua combo (combo_rate)
+    # Tính tỷ lệ mua combo (combo_rate)
     combo_rates: Dict[int, float] = {}
     if df_fnb is not None and not df_fnb.empty and "is_combo" in df_fnb.columns:
         f_clean = df_fnb[df_fnb["is_anomaly"] == 0] if "is_anomaly" in df_fnb.columns else df_fnb
@@ -360,7 +371,6 @@ def build_cluster_profiles(
 
         for cid, group in f_merged.groupby("cluster_id"):
             combo_txns = group[group["is_combo"] == True]["txn_id"].nunique()  # noqa: E712
-            # Mẫu số: tổng giao dịch vé của cụm nếu có, hoặc tổng giao dịch F&B
             ticket_txns = total_ticket_txns_by_cluster.get(cid, 0)
             if ticket_txns > 0:
                 rate = combo_txns / ticket_txns
@@ -375,7 +385,7 @@ def build_cluster_profiles(
 
     cols = [
         "cluster_id", "cluster_name", "customer_count", "pct_customers",
-        "avg_recency", "avg_frequency", "avg_monetary", "top_genre", "combo_rate"
+        "avg_recency", "avg_frequency", "avg_monetary", "avg_tenure", "top_genre", "combo_rate"
     ]
     return profile_df[cols].sort_values("cluster_id").reset_index(drop=True)
 
@@ -389,28 +399,34 @@ def save_rfm_pipeline_results(
 ) -> None:
     """
     Lưu kết quả RFM vào cơ sở dữ liệu:
-    - cinema_dw.rfm_result
-    - cinema_dw.rfm_cluster_profile
+    - cinema_dw.rfm_result (kèm tenure_days)
+    - cinema_dw.rfm_cluster_profile (kèm avg_tenure)
     - cinema_dw.model_metrics (ghi nhận inertia & silhouette)
-    Đảm bảo tính Idempotent: chạy nhiều lần không nhân đôi bản ghi.
+    Đảm bảo Idempotent: chạy nhiều lần không nhân đôi bản ghi.
     """
     with engine.begin() as conn:
         # 1. Ghi rfm_result
         conn.execute(text("DELETE FROM cinema_dw.rfm_result"))
-        rfm_records = df_rfm[[
+        records_to_insert = df_rfm.copy()
+        if "tenure" in records_to_insert.columns:
+            records_to_insert["tenure_days"] = records_to_insert["tenure"]
+        else:
+            records_to_insert["tenure_days"] = 0
+
+        rfm_records = records_to_insert[[
             "customer_key", "customer_id", "recency_days", "frequency",
-            "monetary", "r_score", "f_score", "m_score", "rfm_score",
+            "monetary", "tenure_days", "r_score", "f_score", "m_score", "rfm_score",
             "cluster_id", "cluster_name"
         ]].to_dict(orient="records")
 
         insert_rfm_sql = text("""
             INSERT INTO cinema_dw.rfm_result (
                 customer_key, customer_id, recency_days, frequency,
-                monetary, r_score, f_score, m_score, rfm_score,
+                monetary, tenure_days, r_score, f_score, m_score, rfm_score,
                 cluster_id, cluster_name
             ) VALUES (
                 :customer_key, :customer_id, :recency_days, :frequency,
-                :monetary, :r_score, :f_score, :m_score, :rfm_score,
+                :monetary, :tenure_days, :r_score, :f_score, :m_score, :rfm_score,
                 :cluster_id, :cluster_name
             )
         """)
@@ -422,10 +438,10 @@ def save_rfm_pipeline_results(
         insert_profile_sql = text("""
             INSERT INTO cinema_dw.rfm_cluster_profile (
                 cluster_id, cluster_name, customer_count, pct_customers,
-                avg_recency, avg_frequency, avg_monetary, top_genre, combo_rate
+                avg_recency, avg_frequency, avg_monetary, avg_tenure, top_genre, combo_rate
             ) VALUES (
                 :cluster_id, :cluster_name, :customer_count, :pct_customers,
-                :avg_recency, :avg_frequency, :avg_monetary, :top_genre, :combo_rate
+                :avg_recency, :avg_frequency, :avg_monetary, :avg_tenure, :top_genre, :combo_rate
             )
         """)
         conn.execute(insert_profile_sql, profile_records)

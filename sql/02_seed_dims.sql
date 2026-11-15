@@ -157,7 +157,7 @@ VALUES (
 )
 ON CONFLICT (customer_id) DO NOTHING;
 
--- 6b. Thành viên DISTINCT (loại bỏ GUEST, city/register_date = NULL: chưa có nguồn)
+-- 6b. Thành viên DISTINCT (loại bỏ GUEST, register_date từ staging)
 INSERT INTO cinema_dw.dim_customer (
     customer_id, customer_type, is_guest,
     gender, age_group, membership_tier, city, register_date
@@ -170,11 +170,15 @@ SELECT DISTINCT ON (customer_id)
     NULLIF(age_group, '')           AS age_group,
     NULLIF(membership_tier, '')     AS membership_tier,
     NULL                            AS city,            -- chưa có nguồn (xem data_dictionary.md)
-    NULL                            AS register_date    -- chưa có nguồn
+    NULLIF(register_date, '')::DATE AS register_date
 FROM staging.ticket
 WHERE customer_id <> 'GUEST'
 ORDER BY customer_id
-ON CONFLICT (customer_id) DO NOTHING;
+ON CONFLICT (customer_id) DO UPDATE SET
+    register_date = EXCLUDED.register_date,
+    membership_tier = EXCLUDED.membership_tier,
+    gender = EXCLUDED.gender,
+    age_group = EXCLUDED.age_group;
 
 -- =============================================================================
 -- 7. dim_product — 8 sản phẩm từ staging.fnb

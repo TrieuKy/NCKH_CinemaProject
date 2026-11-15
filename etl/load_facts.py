@@ -39,6 +39,8 @@ def psql_insert_copy(table, conn, keys, data_iter):
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     try:
         # Load cấu hình môi trường từ file .env
         load_dotenv()

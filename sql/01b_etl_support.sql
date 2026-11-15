@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS staging.ticket (
     gender           TEXT,
     age_group        TEXT,
     membership_tier  TEXT,
+    register_date    TEXT,
     channel_code     TEXT,
     ticket_format    TEXT,
     day_type         TEXT,
