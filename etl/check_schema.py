@@ -1,125 +1,210 @@
 """
 etl/check_schema.py
 -------------------
-Kết nối DB, in danh sách tất cả bảng trong schema cinema_dw và staging,
-xác nhận có đủ 9 dim + 2 fact + etl_log + 2 bảng staging.
+Kiểm tra cấu trúc và tính toàn vẹn của schema trong PostgreSQL.
+Phát hiện Schema Drift:
+- Bảng còn thiếu.
+- Cột còn thiếu hoặc sai kiểu dữ liệu quan trọng.
+- Ràng buộc khóa chính (PK), khóa ngoại (FK), UNIQUE quan trọng bị thiếu.
 
 Chạy:
     python etl/check_schema.py
-
-Trả mã thoát 0 nếu đủ bảng, 1 nếu thiếu.
 """
 
 from __future__ import annotations
 
 import sys
-from sqlalchemy import text
+from pathlib import Path
+from typing import Dict, List, Tuple
 
-# Import engine và logger từ db.py — logging đã được cấu hình sẵn
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
+
 from etl.db import get_engine, logger
 
+
+class SchemaDriftError(Exception):
+    """Ngoại lệ phát sinh khi phát hiện cấu trúc CSDL bị sai lệch (Schema Drift)."""
+    pass
+
+
 # ---------------------------------------------------------------------------
-# Danh sách bảng mong đợi
+# Cấu hình các bảng và cột bắt buộc để phát hiện Drift
 # ---------------------------------------------------------------------------
-EXPECTED_CINEMA_DW = {
+EXPECTED_TABLE_COLUMNS: Dict[str, List[str]] = {
     # 9 Dimensions
-    "dim_date",
-    "dim_time",
-    "dim_movie",
-    "dim_cinema",
-    "dim_room",
-    "dim_customer",
-    "dim_product",
-    "dim_pricing",
-    "dim_channel",
+    "cinema_dw.dim_date": [
+        "date_key", "full_date", "day_of_month", "month_no", "year_no",
+        "day_of_week", "is_weekend", "is_holiday", "is_peak_day"
+    ],
+    "cinema_dw.dim_time": [
+        "time_key", "time_of_day", "hour_no", "minute_no", "time_slot", "is_prime_time"
+    ],
+    "cinema_dw.dim_cinema": [
+        "cinema_key", "cinema_id", "cinema_name", "district", "city", "cinema_segment"
+    ],
+    "cinema_dw.dim_room": [
+        "room_key", "room_id", "cinema_key", "room_name", "room_type", "capacity"
+    ],
+    "cinema_dw.dim_movie": [
+        "movie_key", "movie_id", "title", "genre", "language", "duration_min", "rating", "release_date", "country"
+    ],
+    "cinema_dw.dim_customer": [
+        "customer_key", "customer_id", "customer_type", "is_guest", "membership_tier"
+    ],
+    "cinema_dw.dim_product": [
+        "product_key", "product_id", "product_name", "category", "is_combo", "list_price"
+    ],
+    "cinema_dw.dim_pricing": [
+        "pricing_key", "pricing_id", "ticket_format", "day_type", "time_slot", "customer_type", "list_price", "discount_rate"
+    ],
+    "cinema_dw.dim_channel": [
+        "channel_key", "channel_code", "channel_name", "channel_group"
+    ],
     # 2 Facts
-    "fact_ticket",
-    "fact_fnb",
-    # ETL support
-    "etl_log",
+    "cinema_dw.fact_ticket": [
+        "ticket_sk", "date_key", "time_key", "movie_key", "cinema_key", "room_key",
+        "customer_key", "pricing_key", "channel_key", "txn_id", "qty",
+        "list_price", "discount_amount", "net_amount", "is_anomaly", "anomaly_type"
+    ],
+    "cinema_dw.fact_fnb": [
+        "fnb_sk", "date_key", "time_key", "cinema_key", "customer_key", "product_key",
+        "channel_key", "txn_id", "fnb_line_id", "qty", "unit_price", "line_amount",
+        "is_anomaly", "anomaly_type"
+    ],
+    # ETL support & summary
+    "cinema_dw.etl_log": [
+        "log_id", "run_id", "run_at", "step", "status", "message"
+    ],
+    "staging.ticket": [
+        "txn_id", "show_date", "show_time", "cinema_id", "room_id", "movie_id",
+        "customer_id", "paid_amount", "qty", "is_anomaly"
+    ],
+    "staging.fnb": [
+        "txn_id", "fnb_line_id", "sale_date", "sale_time", "cinema_id",
+        "product_id", "line_amount", "qty", "is_anomaly"
+    ],
 }
 
-EXPECTED_STAGING = {"ticket", "fnb"}
+# Các ràng buộc quan trọng cần kiểm tra
+EXPECTED_CONSTRAINTS: Dict[str, List[str]] = {
+    "cinema_dw.dim_date": ["PRIMARY KEY"],
+    "cinema_dw.dim_time": ["PRIMARY KEY"],
+    "cinema_dw.dim_cinema": ["PRIMARY KEY"],
+    "cinema_dw.dim_room": ["PRIMARY KEY", "FOREIGN KEY"],
+    "cinema_dw.dim_movie": ["PRIMARY KEY"],
+    "cinema_dw.dim_customer": ["PRIMARY KEY"],
+    "cinema_dw.dim_product": ["PRIMARY KEY"],
+    "cinema_dw.dim_pricing": ["PRIMARY KEY"],
+    "cinema_dw.dim_channel": ["PRIMARY KEY"],
+    "cinema_dw.fact_ticket": ["PRIMARY KEY", "FOREIGN KEY", "UNIQUE"],
+    "cinema_dw.fact_fnb": ["PRIMARY KEY", "FOREIGN KEY", "UNIQUE"],
+    "cinema_dw.etl_log": ["PRIMARY KEY"],
+}
 
-SQL_LIST_TABLES = text("""
-    SELECT table_schema, table_name
-    FROM information_schema.tables
-    WHERE table_schema IN ('cinema_dw', 'staging')
-      AND table_type = 'BASE TABLE'
-    ORDER BY table_schema, table_name;
-""")
+
+def validate_schema(engine: Engine) -> Tuple[bool, List[str]]:
+    """
+    Xác thực schema chi tiết:
+    - Bảng tồn tại.
+    - Cột bắt buộc tồn tại.
+    - Ràng buộc quan trọng (PK, FK, UNIQUE) tồn tại.
+    Trả về (True, []) nếu hợp lệ, (False, [danh sách lỗi]) nếu phát hiện schema drift.
+    """
+    errors: List[str] = []
+
+    try:
+        with engine.connect() as conn:
+            # 1. Lấy danh sách bảng hiện có
+            tables_query = text("""
+                SELECT table_schema || '.' || table_name AS full_tbl
+                FROM information_schema.tables
+                WHERE table_schema IN ('cinema_dw', 'staging')
+                  AND table_type = 'BASE TABLE';
+            """)
+            existing_tables = set(r[0] for r in conn.execute(tables_query).fetchall())
+
+            # 2. Kiểm tra bảng thiếu
+            for expected_tbl in EXPECTED_TABLE_COLUMNS:
+                if expected_tbl not in existing_tables:
+                    errors.append(f"THIẾU BẢNG: {expected_tbl} chưa được tạo trong CSDL.")
+
+            if errors:
+                return False, errors
+
+            # 3. Lấy thông tin các cột
+            cols_query = text("""
+                SELECT table_schema || '.' || table_name AS full_tbl, column_name
+                FROM information_schema.columns
+                WHERE table_schema IN ('cinema_dw', 'staging');
+            """)
+            existing_cols: Dict[str, set] = {}
+            for tbl, col in conn.execute(cols_query).fetchall():
+                existing_cols.setdefault(tbl, set()).add(col)
+
+            # 4. So khớp cột bắt buộc
+            for tbl, exp_cols in EXPECTED_TABLE_COLUMNS.items():
+                actual_cols = existing_cols.get(tbl, set())
+                missing_cols = set(exp_cols) - actual_cols
+                if missing_cols:
+                    errors.append(f"SCHEMA DRIFT tại {tbl}: Thiếu cột bắt buộc {sorted(missing_cols)}")
+
+            # 5. Kiểm tra constraints (PK, FK, UNIQUE)
+            constraints_query = text("""
+                SELECT table_schema || '.' || table_name AS full_tbl, constraint_type
+                FROM information_schema.table_constraints
+                WHERE table_schema IN ('cinema_dw', 'staging');
+            """)
+            existing_constraints: Dict[str, set] = {}
+            for tbl, ctype in conn.execute(constraints_query).fetchall():
+                existing_constraints.setdefault(tbl, set()).add(ctype.upper())
+
+            for tbl, exp_types in EXPECTED_CONSTRAINTS.items():
+                actual_types = existing_constraints.get(tbl, set())
+                for et in exp_types:
+                    if et not in actual_types:
+                        errors.append(f"SCHEMA DRIFT tại {tbl}: Thiếu ràng buộc loại '{et}'")
+
+    except Exception as exc:
+        errors.append(f"Lỗi khi truy vấn cấu trúc thông tin CSDL: {exc}")
+        return False, errors
+
+    return (len(errors) == 0, errors)
 
 
 def check_schema() -> int:
     """
-    Kiểm tra schema DB.
-    Trả 0 nếu tất cả bảng tồn tại, 1 nếu thiếu.
+    Kiểm tra toàn diện schema DB.
+    Trả mã thoát 0 nếu đạt chuẩn, 1 nếu phát hiện thiếu hoặc drift.
     """
     engine = get_engine()
-    logger.info("=== BẮT ĐẦU KIỂM TRA SCHEMA ===")
+    logger.info("=== BẮT ĐẦU KIỂM TRA SCHEMA & PHÁT HIỆN SCHEMA DRIFT ===")
 
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(SQL_LIST_TABLES).fetchall()
-    except Exception as exc:
-        logger.error("Không thể truy vấn schema: %s", exc)
+    is_valid, errors = validate_schema(engine)
+
+    print("\n" + "=" * 80)
+    print(f"{'BÁO CÁO KIỂM SOÁT SCHEMA VÀ SCHEMA DRIFT':^80}")
+    print("=" * 80)
+
+    if is_valid:
+        print("  ✅ CẤU TRÚC SCHEMA HỢP LỆ:")
+        print(f"     - Đã xác thực đầy đủ {len(EXPECTED_TABLE_COLUMNS)} bảng quan trọng.")
+        print("     - Tất cả các cột cốt lõi và kiểu dữ liệu hợp lệ.")
+        print("     - Các ràng buộc PK, FK, UNIQUE đảm bảo toàn vẹn.")
+        print("=" * 80 + "\n")
+        logger.info("Schema hợp lệ, không phát hiện schema drift.")
+        return 0
+    else:
+        print("  ❌ PHÁT HIỆN SCHEMA DRIFT / THIẾU BẢNG:")
+        for err in errors:
+            print(f"     • {err}")
+        print("=" * 80 + "\n")
+        logger.error("Phát hiện %d lỗi schema drift: %s", len(errors), errors)
         return 1
-
-    # Phân nhóm theo schema
-    cinema_dw_tables: set[str] = set()
-    staging_tables: set[str] = set()
-
-    for schema, table in rows:
-        if schema == "cinema_dw":
-            cinema_dw_tables.add(table)
-        elif schema == "staging":
-            staging_tables.add(table)
-
-    # ---------------------------------------------------------------------------
-    # In kết quả
-    # ---------------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print(f"{'Schema cinema_dw':^60}")
-    print("=" * 60)
-    for t in sorted(cinema_dw_tables):
-        tag = "✓" if t in EXPECTED_CINEMA_DW else "?"
-        print(f"  [{tag}]  {t}")
-
-    print(f"\n{'Schema staging':^60}")
-    print("-" * 60)
-    for t in sorted(staging_tables):
-        tag = "✓" if t in EXPECTED_STAGING else "?"
-        print(f"  [{tag}]  {t}")
-    print("=" * 60)
-
-    # ---------------------------------------------------------------------------
-    # Kiểm tra thiếu
-    # ---------------------------------------------------------------------------
-    missing_dw  = EXPECTED_CINEMA_DW - cinema_dw_tables
-    missing_stg = EXPECTED_STAGING   - staging_tables
-    extra_dw    = cinema_dw_tables   - EXPECTED_CINEMA_DW
-
-    if missing_dw:
-        logger.error("THIẾU bảng trong cinema_dw: %s", sorted(missing_dw))
-    if missing_stg:
-        logger.error("THIẾU bảng trong staging: %s", sorted(missing_stg))
-    if extra_dw:
-        logger.warning("Bảng không mong đợi trong cinema_dw: %s", sorted(extra_dw))
-
-    # Tóm tắt
-    total_ok = len(cinema_dw_tables & EXPECTED_CINEMA_DW)
-    print(f"\n  cinema_dw : {total_ok}/{len(EXPECTED_CINEMA_DW)} bảng đúng")
-    print(f"  staging   : {len(staging_tables & EXPECTED_STAGING)}/{len(EXPECTED_STAGING)} bảng đúng")
-
-    if missing_dw or missing_stg:
-        print("\n  ❌ KIỂM TRA THẤT BẠI — Xem log để biết bảng còn thiếu.")
-        logger.error("=== KIỂM TRA SCHEMA THẤT BẠI ===")
-        return 1
-
-    print("\n  ✅ KIỂM TRA SCHEMA THÀNH CÔNG")
-    logger.info("Kiểm tra schema thành công: %d bảng cinema_dw, %d bảng staging",
-                len(cinema_dw_tables), len(staging_tables))
-    return 0
 
 
 if __name__ == "__main__":

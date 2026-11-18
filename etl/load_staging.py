@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import sys
 import time
+import uuid
 from pathlib import Path
-
 from typing import Optional
+
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
 
 from etl.db import get_engine, logger
 
@@ -57,22 +60,21 @@ def _copy_file(cursor, copy_sql: str, csv_path: Path) -> int:
     return cursor.fetchone()[0]
 
 
-def load_staging(run_id: Optional[str] = None) -> dict[str, int]:
+def load_staging(run_id: Optional[str] = None, engine: Optional[Engine] = None) -> dict[str, int]:
     """
     Nạp cả hai file CSV vào staging.
     Trả dict {'ticket': n_ticket, 'fnb': n_fnb}.
     """
     if run_id is None:
-        import uuid
         run_id = str(uuid.uuid4())
     if not TICKET_CSV.exists() or not FNB_CSV.exists():
-        logger.error(
-            "Chưa tìm thấy file CSV. Chạy: python scripts/generate_mock_data.py"
-        )
-        sys.exit(1)
+        err_msg = "Chưa tìm thấy file CSV staging trong data/. Chạy: python scripts/generate_mock_data.py"
+        logger.error(err_msg)
+        raise FileNotFoundError(err_msg)
 
-    engine = get_engine()
-    logger.info("=== BẮT ĐẦU NẠP STAGING ===")
+    if engine is None:
+        engine = get_engine()
+    logger.info("=== BẮT ĐẦU NẠP STAGING (run_id: %s) ===", run_id)
 
     # Lấy raw psycopg2 connection để dùng copy_expert
     raw_conn = engine.raw_connection()
@@ -124,25 +126,38 @@ def load_staging(run_id: Optional[str] = None) -> dict[str, int]:
         elapsed = time.perf_counter() - t0
         logger.info("BUILD INDEXES hoàn tất trong %.1f giây", elapsed)
 
-        # Ghi log nạp staging
-        try:
-            cursor.execute(
-                """
-                INSERT INTO cinema_dw.etl_log (run_id, step, src_rows, dwh_rows, status, message)
-                VALUES (%s, 'load_staging_ticket', %s, %s, 'OK', 'Nạp staging.ticket thành công'),
-                       (%s, 'load_staging_fnb', %s, %s, 'OK', 'Nạp staging.fnb thành công')
-                """,
-                (run_id, counts.get("ticket", 0), counts.get("ticket", 0), run_id, counts.get("fnb", 0), counts.get("fnb", 0)),
-            )
-        except Exception:
-            pass
+        # Ghi audit log sau khi nạp và đánh index thành công
+        cursor.execute(
+            """
+            INSERT INTO cinema_dw.etl_log (run_id, step, src_rows, dwh_rows, status, message)
+            VALUES (%s, 'load_staging_ticket', %s, %s, 'OK', 'Nạp staging.ticket thành công'),
+                   (%s, 'load_staging_fnb', %s, %s, 'OK', 'Nạp staging.fnb thành công')
+            """,
+            (run_id, counts.get("ticket", 0), counts.get("ticket", 0), run_id, counts.get("fnb", 0), counts.get("fnb", 0)),
+        )
 
         raw_conn.commit()
         cursor.close()
 
     except Exception as exc:
-        raw_conn.rollback()
-        logger.error("Lỗi khi nạp staging: %s", exc)
+        try:
+            raw_conn.rollback()
+        except Exception:
+            pass
+        logger.error("Lỗi khi nạp staging: %s (Đã rollback)", exc)
+
+        # Ghi log thất bại qua kết nối riêng rẽ
+        try:
+            with engine.begin() as conn_fail:
+                conn_fail.execute(
+                    text("""
+                        INSERT INTO cinema_dw.etl_log (run_id, step, status, message)
+                        VALUES (:run_id, 'load_staging', 'FAIL', :msg)
+                    """),
+                    {"run_id": run_id, "msg": str(exc)[:500]},
+                )
+        except Exception as log_err:
+            logger.warning("Không thể ghi log thất bại cho load_staging: %s", log_err)
         raise
     finally:
         raw_conn.close()

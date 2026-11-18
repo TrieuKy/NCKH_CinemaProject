@@ -30,16 +30,18 @@ import uuid
 from typing import Optional
 
 from sqlalchemy import text
+from sqlalchemy.engine import Engine
 
 from etl.db import get_engine, logger
 
 
-def reconcile(run_id: Optional[str] = None) -> bool:
+def reconcile(run_id: Optional[str] = None, engine: Optional[Engine] = None) -> bool:
     """
     Thực thi toàn bộ các bước đối soát QC, ghi nhận vào cinema_dw.etl_log.
     Trả về True nếu tất cả các bước đạt trạng thái OK.
     """
-    engine = get_engine()
+    if engine is None:
+        engine = get_engine()
     if run_id is None:
         run_id = str(uuid.uuid4())
 
@@ -336,6 +338,19 @@ def reconcile(run_id: Optional[str] = None) -> bool:
                 logger.info("%-32s | %-4s | %s", q["step"], status, msg)
     except Exception as exc:
         logger.error("Lỗi khi đối soát: %s", exc)
+        try:
+            with engine.begin() as conn_fail:
+                conn_fail.execute(
+                    text("""
+                        INSERT INTO cinema_dw.etl_log 
+                            (run_id, step, status, message)
+                        VALUES 
+                            (:run_id, 'reconcile', 'FAIL', :msg)
+                    """),
+                    {"run_id": run_id, "msg": str(exc)[:500]},
+                )
+        except Exception as log_err:
+            logger.warning("Không thể ghi log thất bại cho reconcile: %s", log_err)
         return False
 
     logger.info("=== ĐỐI SOÁT HOÀN TẤT: %s ===", "TẤT CẢ ĐẠT (PASS)" if not has_fail else "CÓ BƯỚC THẤT BẠI (FAIL)")

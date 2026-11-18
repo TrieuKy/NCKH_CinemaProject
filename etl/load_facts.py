@@ -15,7 +15,6 @@ Wrapper nạp dữ liệu Fact (fact_ticket, fact_fnb) bằng phương thức SQ
 
 from __future__ import annotations
 
-import re
 import sys
 import time
 import uuid
@@ -26,25 +25,11 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from etl.db import get_engine, logger
+from etl.sql_utils import split_sql_statements
 
 # Đường dẫn file SQL nạp fact chính thức
 ROOT = Path(__file__).resolve().parents[1]
 SQL_FILE = ROOT / "sql" / "03_load_facts.sql"
-
-
-def _split_statements(sql: str) -> list[str]:
-    """
-    Tách nội dung SQL thành danh sách các câu lệnh riêng lẻ dựa trên dấu ';'.
-    Loại bỏ các dòng comment và câu lệnh rỗng để thực thi tuần tự an toàn.
-    """
-    parts = sql.split(";")
-    stmts: list[str] = []
-    for part in parts:
-        stripped = part.strip()
-        no_comments = re.sub(r"--[^\n]*", "", stripped).strip()
-        if no_comments:
-            stmts.append(stripped)
-    return stmts
 
 
 def load_facts(engine: Optional[Engine] = None, run_id: Optional[str] = None) -> dict[str, int]:
@@ -67,7 +52,7 @@ def load_facts(engine: Optional[Engine] = None, run_id: Optional[str] = None) ->
         raise FileNotFoundError(err_msg)
 
     sql_content = SQL_FILE.read_text(encoding="utf-8")
-    statements = _split_statements(sql_content)
+    statements = split_sql_statements(sql_content)
 
     counts = {"fact_ticket": 0, "fact_fnb": 0}
     t0 = time.perf_counter()
@@ -76,7 +61,6 @@ def load_facts(engine: Optional[Engine] = None, run_id: Optional[str] = None) ->
     try:
         with engine.begin() as conn:
             for idx, stmt in enumerate(statements, 1):
-                # Nhận diện mục đích câu lệnh để log
                 upper_stmt = stmt.upper()
                 if "TRUNCATE" in upper_stmt:
                     label = "TRUNCATE fact_ticket, fact_fnb"
@@ -127,7 +111,7 @@ def load_facts(engine: Optional[Engine] = None, run_id: Optional[str] = None) ->
 
     except Exception as exc:
         logger.error("Lỗi khi nạp fact tables: %s (Đã tự động rollback transaction)", exc)
-        # Ghi log thất bại nếu có thể mở kết nối mới
+        # Ghi log thất bại qua kết nối riêng
         try:
             with engine.begin() as conn_fail:
                 conn_fail.execute(
@@ -139,8 +123,8 @@ def load_facts(engine: Optional[Engine] = None, run_id: Optional[str] = None) ->
                     """),
                     {"run_id": run_id, "msg": str(exc)[:500]},
                 )
-        except Exception:
-            pass
+        except Exception as log_err:
+            logger.warning("Không thể ghi log thất bại cho load_facts: %s", log_err)
         raise
 
 
@@ -153,7 +137,6 @@ def main() -> None:
             pass
     try:
         counts = load_facts()
-        # Giữ đúng format in terminal ban đầu
         print(f"Số lượng dòng đã nạp thành công vào fact_ticket: {counts['fact_ticket']:,}")
         print(f"Số lượng dòng đã nạp thành công vào fact_fnb: {counts['fact_fnb']:,}")
     except Exception as exc:

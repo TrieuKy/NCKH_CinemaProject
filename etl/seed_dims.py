@@ -1,7 +1,7 @@
 """
 etl/seed_dims.py
 ----------------
-Đọc sql/02_seed_dims.sql, tách thành từng lệnh INSERT, thực thi theo thứ tự,
+Đọc sql/02_seed_dims.sql, tách thành từng lệnh INSERT an toàn, thực thi theo thứ tự,
 rồi in bảng đếm số dòng của tất cả bảng staging và dim.
 
 Lý do tách thành các statement riêng (không thực thi cả file một lần):
@@ -15,18 +15,20 @@ Chạy: python -m etl.seed_dims
 
 from __future__ import annotations
 
-import sys
 import re
+import sys
 import uuid
 from pathlib import Path
 from typing import Optional
 
 from sqlalchemy import text
+from sqlalchemy.engine import Engine
 
 from etl.db import get_engine, logger
+from etl.sql_utils import split_sql_statements
 
 # ---------------------------------------------------------------------------
-ROOT    = Path(__file__).resolve().parents[1]
+ROOT     = Path(__file__).resolve().parents[1]
 SQL_FILE = ROOT / "sql" / "02_seed_dims.sql"
 
 # Thứ tự bảng cần đếm (dim_room phụ thuộc dim_cinema → đã xử lý trong SQL)
@@ -45,27 +47,10 @@ DIM_TABLES = [
 STAGING_TABLES = ["staging.ticket", "staging.fnb"]
 
 
-def _split_statements(sql: str) -> list[str]:
-    """
-    Tách nội dung SQL thành danh sách câu lệnh dựa trên dấu ';'.
-    Bỏ qua dòng comment thuần (--) và câu lệnh rỗng.
-    Giữ nguyên comment trong nội dung câu lệnh (để dim dễ đọc trong log).
-    """
-    # Tách theo ';' — giữ các phần
-    parts = sql.split(";")
-    stmts = []
-    for part in parts:
-        stripped = part.strip()
-        # Lọc phần chỉ có comment hoặc rỗng
-        no_comments = re.sub(r'--[^\n]*', '', stripped).strip()
-        if no_comments:
-            stmts.append(stripped)
-    return stmts
-
-
-def seed_dims(run_id: Optional[str] = None) -> bool:
+def seed_dims(run_id: Optional[str] = None, engine: Optional[Engine] = None) -> bool:
     """
     Thực thi 02_seed_dims.sql, trả True nếu tất cả dim thành công.
+    Ghi nhận audit log đầy đủ (OK hoặc FAIL) vào cinema_dw.etl_log.
     """
     if run_id is None:
         run_id = str(uuid.uuid4())
@@ -74,14 +59,15 @@ def seed_dims(run_id: Optional[str] = None) -> bool:
         logger.error("Không tìm thấy %s", SQL_FILE)
         return False
 
+    if engine is None:
+        engine = get_engine()
+
     sql_content = SQL_FILE.read_text(encoding="utf-8")
-    statements  = _split_statements(sql_content)
+    statements  = split_sql_statements(sql_content)
 
     logger.info("=== BẮT ĐẦU SEED DIMENSIONS (%d câu lệnh) | run_id: %s ===", len(statements), run_id)
 
-    engine = get_engine()
-
-    # Thực thi từng statement trong cùng một transaction
+    # Thực thi toàn bộ trong cùng một transaction
     # (rollback toàn bộ nếu một dim lỗi → tránh trạng thái nửa vời)
     try:
         with engine.begin() as conn:
@@ -93,7 +79,7 @@ def seed_dims(run_id: Optional[str] = None) -> bool:
                 logger.info("[%d/%d] Seeding %-20s …", i, len(statements), label)
                 conn.execute(text(stmt))
 
-            # Ghi etl_log
+            # Ghi etl_log thành công bên trong cùng transaction
             conn.execute(
                 text("""
                     INSERT INTO cinema_dw.etl_log (run_id, step, status, message)
@@ -103,7 +89,19 @@ def seed_dims(run_id: Optional[str] = None) -> bool:
             )
 
     except Exception as exc:
-        logger.error("Lỗi khi seed dim: %s", exc)
+        logger.error("Lỗi khi seed dim: %s (Đã tự động rollback)", exc)
+        # Ghi log FAIL bằng một transaction riêng biệt
+        try:
+            with engine.begin() as conn_fail:
+                conn_fail.execute(
+                    text("""
+                        INSERT INTO cinema_dw.etl_log (run_id, step, status, message)
+                        VALUES (:run_id, 'seed_dims', 'FAIL', :msg)
+                    """),
+                    {"run_id": run_id, "msg": str(exc)[:500]},
+                )
+        except Exception as log_err:
+            logger.warning("Không thể ghi audit log thất bại cho seed_dims: %s", log_err)
         return False
 
     logger.info("=== SEED DIMENSIONS HOÀN TẤT ===")
@@ -138,7 +136,6 @@ def print_counts() -> None:
         print(f"│ {tbl:<30} │ {cnt:>13,} │")
     print("└──────────────────────────────┴───────────────┘")
 
-    # Kiểm tra nhanh một số kỳ vọng
     dim_counts = {r[0].split(".")[-1]: r[1] for r in rows}
 
     checks = [
@@ -181,7 +178,6 @@ def print_counts() -> None:
 
 if __name__ == "__main__":
     ok = seed_dims()
-    if not ok:
-        sys.exit(1)
-    print_counts()
-    sys.exit(0)
+    if ok:
+        print_counts()
+    sys.exit(0 if ok else 1)
