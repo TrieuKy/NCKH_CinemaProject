@@ -21,6 +21,8 @@ import sys
 import time
 from pathlib import Path
 
+from typing import Optional
+
 from etl.db import get_engine, logger
 
 # ---------------------------------------------------------------------------
@@ -55,11 +57,14 @@ def _copy_file(cursor, copy_sql: str, csv_path: Path) -> int:
     return cursor.fetchone()[0]
 
 
-def load_staging() -> dict[str, int]:
+def load_staging(run_id: Optional[str] = None) -> dict[str, int]:
     """
     Nạp cả hai file CSV vào staging.
     Trả dict {'ticket': n_ticket, 'fnb': n_fnb}.
     """
+    if run_id is None:
+        import uuid
+        run_id = str(uuid.uuid4())
     if not TICKET_CSV.exists() or not FNB_CSV.exists():
         logger.error(
             "Chưa tìm thấy file CSV. Chạy: python scripts/generate_mock_data.py"
@@ -118,6 +123,19 @@ def load_staging() -> dict[str, int]:
         cursor.execute(indexes_sql)
         elapsed = time.perf_counter() - t0
         logger.info("BUILD INDEXES hoàn tất trong %.1f giây", elapsed)
+
+        # Ghi log nạp staging
+        try:
+            cursor.execute(
+                """
+                INSERT INTO cinema_dw.etl_log (run_id, step, src_rows, dwh_rows, status, message)
+                VALUES (%s, 'load_staging_ticket', %s, %s, 'OK', 'Nạp staging.ticket thành công'),
+                       (%s, 'load_staging_fnb', %s, %s, 'OK', 'Nạp staging.fnb thành công')
+                """,
+                (run_id, counts.get("ticket", 0), counts.get("ticket", 0), run_id, counts.get("fnb", 0), counts.get("fnb", 0)),
+            )
+        except Exception:
+            pass
 
         raw_conn.commit()
         cursor.close()

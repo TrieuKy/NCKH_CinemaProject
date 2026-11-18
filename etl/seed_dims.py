@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import sys
 import re
+import uuid
 from pathlib import Path
+from typing import Optional
 
 from sqlalchemy import text
 
@@ -61,10 +63,13 @@ def _split_statements(sql: str) -> list[str]:
     return stmts
 
 
-def seed_dims() -> bool:
+def seed_dims(run_id: Optional[str] = None) -> bool:
     """
     Thực thi 02_seed_dims.sql, trả True nếu tất cả dim thành công.
     """
+    if run_id is None:
+        run_id = str(uuid.uuid4())
+
     if not SQL_FILE.exists():
         logger.error("Không tìm thấy %s", SQL_FILE)
         return False
@@ -72,7 +77,7 @@ def seed_dims() -> bool:
     sql_content = SQL_FILE.read_text(encoding="utf-8")
     statements  = _split_statements(sql_content)
 
-    logger.info("=== BẮT ĐẦU SEED DIMENSIONS (%d câu lệnh) ===", len(statements))
+    logger.info("=== BẮT ĐẦU SEED DIMENSIONS (%d câu lệnh) | run_id: %s ===", len(statements), run_id)
 
     engine = get_engine()
 
@@ -87,6 +92,15 @@ def seed_dims() -> bool:
 
                 logger.info("[%d/%d] Seeding %-20s …", i, len(statements), label)
                 conn.execute(text(stmt))
+
+            # Ghi etl_log
+            conn.execute(
+                text("""
+                    INSERT INTO cinema_dw.etl_log (run_id, step, status, message)
+                    VALUES (:run_id, 'seed_dims', 'OK', 'Seed 9 dimensions thành công')
+                """),
+                {"run_id": run_id},
+            )
 
     except Exception as exc:
         logger.error("Lỗi khi seed dim: %s", exc)

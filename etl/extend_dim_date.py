@@ -1,12 +1,16 @@
 import sys
+import uuid
 from datetime import date, timedelta
+from typing import Optional
 from sqlalchemy import text
 from etl.db import get_engine, logger
 from core.holidays import get_holidays_range, get_peak_days_range
 
-def extend_dim_date():
+def extend_dim_date(run_id: Optional[str] = None):
     engine = get_engine()
-    logger.info("=== EXTEND DIM_DATE TO 2027-12-31 ===")
+    if run_id is None:
+        run_id = str(uuid.uuid4())
+    logger.info("=== EXTEND DIM_DATE TO 2027-12-31 | run_id: %s ===", run_id)
     
     # Generate all dates from 2025-10-01 to 2027-12-31
     start_date = date(2025, 10, 1)

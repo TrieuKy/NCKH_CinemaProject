@@ -99,8 +99,8 @@ JOIN cinema_dw.dim_channel ch ON ch.channel_code = t.channel_code
 -- ---------------------------------------------------------------------------
 -- fact_fnb: JOIN 6 dim (không có movie_key, room_key, pricing_key)
 -- ---------------------------------------------------------------------------
--- txn_id trong fnb phải có trong fact_ticket (tránh F&B mồ côi).
--- Lý do không dùng FK cứng (ghi trong schema): linh hoạt hơn khi load batch.
+-- txn_id trong fnb bắt buộc phải tồn tại trong fact_ticket (loại bỏ F&B mồ côi).
+-- Sử dụng WHERE EXISTS đối chiếu trực tiếp với fact_ticket.
 INSERT INTO cinema_dw.fact_fnb (
     date_key, time_key, cinema_key, customer_key, product_key, channel_key,
     txn_id, fnb_line_id,
@@ -144,4 +144,9 @@ JOIN cinema_dw.dim_customer cu ON cu.customer_id = f.customer_id
 JOIN cinema_dw.dim_product dp ON dp.product_id = f.product_id
 
 JOIN cinema_dw.dim_channel ch ON ch.channel_code = f.channel_code
+
+WHERE EXISTS (
+    SELECT 1 FROM cinema_dw.fact_ticket ft
+    WHERE ft.txn_id = f.txn_id
+)
 ;

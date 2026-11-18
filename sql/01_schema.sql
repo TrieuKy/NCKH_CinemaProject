@@ -17,7 +17,7 @@ SET search_path TO cinema_dw, public;
 -- -----------------------------------------------------------------------------
 
 -- Lịch: một dòng / ngày. date_key dạng YYYYMMDD để JOIN không cần CAST date.
-CREATE TABLE dim_date (
+CREATE TABLE IF NOT EXISTS dim_date (
     date_key        INTEGER PRIMARY KEY,          -- 20250401
     full_date       DATE        NOT NULL UNIQUE,
     day_of_month    SMALLINT    NOT NULL,
@@ -37,7 +37,7 @@ CREATE TABLE dim_date (
 COMMENT ON TABLE dim_date IS 'Chiều thời gian theo ngày — KPI theo tuần/tháng/lễ.';
 
 -- Giờ trong ngày: 1440 dòng (00:00–23:59). time_key = hour*100 + minute (1930 = 19:30).
-CREATE TABLE dim_time (
+CREATE TABLE IF NOT EXISTS dim_time (
     time_key        INTEGER PRIMARY KEY,          -- 0–2359 theo HHMM
     time_of_day     TIME        NOT NULL UNIQUE,
     hour_no         SMALLINT    NOT NULL,
@@ -48,7 +48,7 @@ CREATE TABLE dim_time (
 
 COMMENT ON TABLE dim_time IS 'Chiều giờ — tách khỏi ngày để phân tích khung giờ vàng.';
 
-CREATE TABLE dim_movie (
+CREATE TABLE IF NOT EXISTS dim_movie (
     movie_key       INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     movie_id        VARCHAR(20)  NOT NULL UNIQUE,
     title           VARCHAR(200) NOT NULL,
@@ -62,7 +62,7 @@ CREATE TABLE dim_movie (
 
 COMMENT ON TABLE dim_movie IS 'Chiều phim. Cờ "phim mới" tính lúc ETL: show_date - release_date.';
 
-CREATE TABLE dim_cinema (
+CREATE TABLE IF NOT EXISTS dim_cinema (
     cinema_key      INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     cinema_id       VARCHAR(20)  NOT NULL UNIQUE,
     cinema_name     VARCHAR(120) NOT NULL,
@@ -74,7 +74,7 @@ CREATE TABLE dim_cinema (
 
 COMMENT ON TABLE dim_cinema IS '3 rạp CGV: Landmark 81, Vincom Đồng Khởi, Pearl Plaza.';
 
-CREATE TABLE dim_room (
+CREATE TABLE IF NOT EXISTS dim_room (
     room_key        INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     room_id         VARCHAR(20)  NOT NULL UNIQUE,
     cinema_key      INTEGER      NOT NULL REFERENCES dim_cinema (cinema_key),
@@ -87,7 +87,7 @@ COMMENT ON TABLE dim_room IS 'Phòng chiếu. Capacity dùng đối soát occupa
 
 -- Quy ước khách vãng lai: đúng 1 dòng customer_id = 'GUEST', is_guest = TRUE.
 -- Thành viên: CUS000001…  |  Không sinh guest giả theo từng giao dịch.
-CREATE TABLE dim_customer (
+CREATE TABLE IF NOT EXISTS dim_customer (
     customer_key      INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     customer_id       VARCHAR(20)  NOT NULL UNIQUE,
     customer_type     VARCHAR(20)  NOT NULL CHECK (customer_type IN ('MEMBER', 'WALK_IN')),
@@ -101,7 +101,7 @@ CREATE TABLE dim_customer (
 
 COMMENT ON TABLE dim_customer IS 'GUEST = khách không định danh. Dùng cho tỷ lệ thành viên, không dùng cho RFM cá nhân.';
 
-CREATE TABLE dim_product (
+CREATE TABLE IF NOT EXISTS dim_product (
     product_key       INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     product_id        VARCHAR(20)  NOT NULL UNIQUE,
     product_name      VARCHAR(120) NOT NULL,
@@ -113,7 +113,7 @@ CREATE TABLE dim_product (
 COMMENT ON TABLE dim_product IS 'Menu bắp nước. Hạt F&B join về đây.';
 
 -- Bảng giá: một dòng = một chính sách giá (format + loại ngày + khung giờ + đối tượng).
-CREATE TABLE dim_pricing (
+CREATE TABLE IF NOT EXISTS dim_pricing (
     pricing_key       INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     pricing_id        VARCHAR(40)  NOT NULL UNIQUE,
     ticket_format     VARCHAR(20)  NOT NULL,     -- 2D / 3D / IMAX
@@ -129,7 +129,7 @@ CREATE TABLE dim_pricing (
 
 COMMENT ON TABLE dim_pricing IS 'Giá và mức giảm — phục vụ what-if giá ở giai đoạn sau.';
 
-CREATE TABLE dim_channel (
+CREATE TABLE IF NOT EXISTS dim_channel (
     channel_key       INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     channel_code      VARCHAR(20)  NOT NULL UNIQUE,
     channel_name      VARCHAR(80)  NOT NULL,
@@ -142,7 +142,7 @@ COMMENT ON TABLE dim_channel IS 'POS / APP / WEB — kênh App là hướng mở
 -- FACTS
 -- -----------------------------------------------------------------------------
 
-CREATE TABLE fact_ticket (
+CREATE TABLE IF NOT EXISTS fact_ticket (
     ticket_sk         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     date_key          INTEGER      NOT NULL REFERENCES dim_date (date_key),
     time_key          INTEGER      NOT NULL REFERENCES dim_time (time_key),
@@ -165,13 +165,13 @@ CREATE TABLE fact_ticket (
 COMMENT ON TABLE fact_ticket IS 'Fact vé — grain 1 giao dịch x loại ghế. txn_id duy nhất, nối fact_fnb và POS.';
 COMMENT ON COLUMN fact_ticket.txn_id IS 'Mã giao dịch POS/APP/WEB, UNIQUE, dùng JOIN fact_fnb.';
 
-CREATE INDEX idx_fact_ticket_date   ON fact_ticket (date_key);
-CREATE INDEX idx_fact_ticket_movie  ON fact_ticket (movie_key);
-CREATE INDEX idx_fact_ticket_cinema ON fact_ticket (cinema_key);
-CREATE INDEX idx_fact_ticket_cust   ON fact_ticket (customer_key);
-CREATE INDEX idx_fact_ticket_anom   ON fact_ticket (is_anomaly);
+CREATE INDEX IF NOT EXISTS idx_fact_ticket_date   ON fact_ticket (date_key);
+CREATE INDEX IF NOT EXISTS idx_fact_ticket_movie  ON fact_ticket (movie_key);
+CREATE INDEX IF NOT EXISTS idx_fact_ticket_cinema ON fact_ticket (cinema_key);
+CREATE INDEX IF NOT EXISTS idx_fact_ticket_cust   ON fact_ticket (customer_key);
+CREATE INDEX IF NOT EXISTS idx_fact_ticket_anom   ON fact_ticket (is_anomaly);
 
-CREATE TABLE fact_fnb (
+CREATE TABLE IF NOT EXISTS fact_fnb (
     fnb_sk            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     date_key          INTEGER      NOT NULL REFERENCES dim_date (date_key),
     time_key          INTEGER      NOT NULL REFERENCES dim_time (time_key),
@@ -192,8 +192,8 @@ CREATE TABLE fact_fnb (
 COMMENT ON TABLE fact_fnb IS 'Fact bắp nước — grain 1 dòng SP / giao dịch. txn_id bắt buộc.';
 COMMENT ON COLUMN fact_fnb.txn_id IS 'Khóa nghiệp vụ nối với fact_ticket (không phải FK cứng: một txn có thể chưa có F&B).';
 
-CREATE INDEX idx_fact_fnb_txn     ON fact_fnb (txn_id);
-CREATE INDEX idx_fact_fnb_date    ON fact_fnb (date_key);
-CREATE INDEX idx_fact_fnb_product ON fact_fnb (product_key);
-CREATE INDEX idx_fact_fnb_cinema  ON fact_fnb (cinema_key);
-CREATE INDEX idx_fact_fnb_anom    ON fact_fnb (is_anomaly);
+CREATE INDEX IF NOT EXISTS idx_fact_fnb_txn     ON fact_fnb (txn_id);
+CREATE INDEX IF NOT EXISTS idx_fact_fnb_date    ON fact_fnb (date_key);
+CREATE INDEX IF NOT EXISTS idx_fact_fnb_product ON fact_fnb (product_key);
+CREATE INDEX IF NOT EXISTS idx_fact_fnb_cinema  ON fact_fnb (cinema_key);
+CREATE INDEX IF NOT EXISTS idx_fact_fnb_anom    ON fact_fnb (is_anomaly);

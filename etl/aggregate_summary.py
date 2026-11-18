@@ -11,12 +11,14 @@ Thực hiện:
 
 import sys
 import uuid
+from typing import Optional
 from sqlalchemy import text
 from etl.db import get_engine, logger
 
-def run_aggregation():
+def run_aggregation(run_id: Optional[str] = None):
     engine = get_engine()
-    run_id = str(uuid.uuid4())
+    if run_id is None:
+        run_id = str(uuid.uuid4())
     logger.info("=== BẮT ĐẦU AGGREGATE SUMMARY (run_id: %s) ===", run_id)
     
     with engine.begin() as conn:

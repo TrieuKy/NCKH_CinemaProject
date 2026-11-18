@@ -1,290 +1,161 @@
 """
 etl/load_facts.py
 -----------------
-Script ETL nạp dữ liệu vào các bảng fact trong PostgreSQL từ file CSV:
-1. Đọc dữ liệu từ staging_ticket.csv và staging_fnb.csv trong data/.
-2. Làm sạch: Bỏ qua (drop) các dòng thiếu txn_id.
-3. Nghiệp vụ: Gán 'GUEST' cho customer_id bị null/NaN.
-4. Nạp dữ liệu vào các bảng fact tương ứng trong PostgreSQL.
-5. In số lượng dòng nạp thành công ra terminal để đối soát.
+Wrapper nạp dữ liệu Fact (fact_ticket, fact_fnb) bằng phương thức SQL Set-based (sql/03_load_facts.sql).
+
+Đảm bảo:
+  1. 100% Set-based trong PostgreSQL (tốc độ cao, không tốn RAM máy trạm do Pandas merge).
+  2. Toàn vẹn Transaction: TRUNCATE và INSERT của cả hai bảng fact_ticket và fact_fnb
+     được thực thi trong CÙNG MỘT database transaction (với engine.begin()).
+     Nếu một câu lệnh gặp lỗi, toàn bộ transaction sẽ rollback (nguyên tử hóa).
+  3. Tương thích ngược: Duy trì giao diện gọi hàm load_facts(), main() và lệnh CLI:
+         python -m etl.load_facts
+  4. Ghi audit log chuẩn xác vào cinema_dw.etl_log theo run_id đồng bộ.
 """
 
-import csv
-import io
-import os
+from __future__ import annotations
+
+import re
 import sys
+import time
+import uuid
 from pathlib import Path
-from dotenv import load_dotenv
-import pandas as pd
-from sqlalchemy import create_engine, text
+from typing import Optional
+
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
+
+from etl.db import get_engine, logger
+
+# Đường dẫn file SQL nạp fact chính thức
+ROOT = Path(__file__).resolve().parents[1]
+SQL_FILE = ROOT / "sql" / "03_load_facts.sql"
 
 
-def psql_insert_copy(table, conn, keys, data_iter):
+def _split_statements(sql: str) -> list[str]:
     """
-    Tối ưu tốc độ nạp dữ liệu lớn cho PostgreSQL qua lệnh COPY FROM STDIN.
+    Tách nội dung SQL thành danh sách các câu lệnh riêng lẻ dựa trên dấu ';'.
+    Loại bỏ các dòng comment và câu lệnh rỗng để thực thi tuần tự an toàn.
     """
-    dbapi_conn = conn.connection
-    with dbapi_conn.cursor() as cur:
-        s_buf = io.StringIO()
-        writer = csv.writer(s_buf)
-        writer.writerows(data_iter)
-        s_buf.seek(0)
-        columns = ", ".join([f'"{k}"' for k in keys])
-        schema_prefix = f'"{table.schema}".' if table.schema else ""
-        sql = (
-            f'COPY {schema_prefix}"{table.name}" ({columns}) '
-            f'FROM STDIN WITH (FORMAT CSV, NULL "")'
-        )
-        cur.copy_expert(sql=sql, file=s_buf)
+    parts = sql.split(";")
+    stmts: list[str] = []
+    for part in parts:
+        stripped = part.strip()
+        no_comments = re.sub(r"--[^\n]*", "", stripped).strip()
+        if no_comments:
+            stmts.append(stripped)
+    return stmts
 
 
-def main():
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
+def load_facts(engine: Optional[Engine] = None, run_id: Optional[str] = None) -> dict[str, int]:
+    """
+    Nạp dữ liệu fact_ticket và fact_fnb từ staging bằng SQL Set-based.
+    Toàn bộ quá trình TRUNCATE và INSERT diễn ra trong một database transaction duy nhất.
+
+    Trả về dict số lượng dòng nạp: {'fact_ticket': count_t, 'fact_fnb': count_f}.
+    """
+    if engine is None:
+        engine = get_engine()
+    if run_id is None:
+        run_id = str(uuid.uuid4())
+
+    logger.info("=== BẮT ĐẦU NẠP FACT TABLES (SQL SET-BASED) | run_id: %s ===", run_id)
+
+    if not SQL_FILE.exists():
+        err_msg = f"Không tìm thấy file SQL nạp fact: {SQL_FILE}"
+        logger.error(err_msg)
+        raise FileNotFoundError(err_msg)
+
+    sql_content = SQL_FILE.read_text(encoding="utf-8")
+    statements = _split_statements(sql_content)
+
+    counts = {"fact_ticket": 0, "fact_fnb": 0}
+    t0 = time.perf_counter()
+
+    # THỰC THI TOÀN BỘ TRONG 1 TRANSACTION NGUYÊN TỬ (ATOMIC)
     try:
-        # Load cấu hình môi trường từ file .env
-        load_dotenv()
-        db_user = os.getenv("DB_USER", "postgres")
-        db_password = os.getenv("DB_PASSWORD", "")
-        db_host = os.getenv("DB_HOST", "localhost")
-        db_port = os.getenv("DB_PORT", "5432")
-        db_name = os.getenv("DB_NAME", "cinema_dw")
-
-        db_url = (
-            f"postgresql+psycopg2://{db_user}:{db_password}@"
-            f"{db_host}:{db_port}/{db_name}"
-        )
-        engine = create_engine(db_url)
-
-        base_dir = Path(__file__).resolve().parent.parent
-        ticket_csv_path = base_dir / "data" / "staging_ticket.csv"
-        fnb_csv_path = base_dir / "data" / "staging_fnb.csv"
-
-        # 1. Đọc dữ liệu từ hai file CSV trong thư mục data/
-        print("Đang đọc dữ liệu từ data/staging_ticket.csv và data/staging_fnb.csv...")
-        df_ticket = pd.read_csv(ticket_csv_path)
-        df_fnb = pd.read_csv(fnb_csv_path)
-
-        # 2. Làm sạch dữ liệu: Bỏ qua các dòng không có mã giao dịch (txn_id)
-        df_ticket = df_ticket.dropna(subset=["txn_id"]).copy()
-        df_fnb = df_fnb.dropna(subset=["txn_id"]).copy()
-
-        # 3. Xử lý logic nghiệp vụ: customer_id null/NaN gán là 'GUEST'
-        df_ticket["customer_id"] = df_ticket["customer_id"].fillna("GUEST")
-        df_fnb["customer_id"] = df_fnb["customer_id"].fillna("GUEST")
-
-        # 4. Nạp dữ liệu vào các bảng fact tương ứng trong PostgreSQL
-        with engine.connect() as conn:
-            target_schema = "cinema_dw"
-            cols_query = text(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = :schema AND table_name = 'fact_ticket'"
-            )
-            cols_ticket = [
-                row[0]
-                for row in conn.execute(
-                    cols_query, {"schema": target_schema}
-                ).fetchall()
-            ]
-            if not cols_ticket:
-                target_schema = "public"
-                cols_ticket = [
-                    row[0]
-                    for row in conn.execute(
-                        cols_query, {"schema": target_schema}
-                    ).fetchall()
-                ]
-
-        # Kiểm tra nếu bảng fact theo Star Schema (cần tra cứu surrogate keys)
-        if "movie_key" in cols_ticket and "movie_id" not in cols_ticket:
-            dim_movie = pd.read_sql(
-                f"SELECT movie_key, movie_id FROM {target_schema}.dim_movie",
-                engine,
-            )
-            dim_cinema = pd.read_sql(
-                f"SELECT cinema_key, cinema_id FROM {target_schema}.dim_cinema",
-                engine,
-            )
-            dim_room = pd.read_sql(
-                f"SELECT room_key, room_id FROM {target_schema}.dim_room",
-                engine,
-            )
-            dim_customer = pd.read_sql(
-                f"SELECT customer_key, customer_id FROM {target_schema}.dim_customer",
-                engine,
-            )
-            dim_pricing = pd.read_sql(
-                f"SELECT pricing_key, ticket_format, day_type, time_slot, customer_type, "
-                f"ROUND(discount_rate::numeric, 4) AS discount_rate FROM {target_schema}.dim_pricing",
-                engine,
-            )
-            dim_channel = pd.read_sql(
-                f"SELECT channel_key, channel_code FROM {target_schema}.dim_channel",
-                engine,
-            )
-            dim_product = pd.read_sql(
-                f"SELECT product_key, product_id FROM {target_schema}.dim_product",
-                engine,
-            )
-
-            # Chuẩn bị date_key và time_key cho vé
-            df_ticket["date_key"] = (
-                pd.to_datetime(df_ticket["show_date"])
-                .dt.strftime("%Y%m%d")
-                .astype(int)
-            )
-            show_time_dt = pd.to_datetime(
-                df_ticket["show_time"].astype(str), format="%H:%M:%S"
-            )
-            df_ticket["time_key"] = (
-                show_time_dt.dt.hour * 100 + show_time_dt.dt.minute
-            )
-            df_ticket["discount_rate"] = df_ticket["discount_rate"].round(4)
-            df_ticket["net_amount"] = df_ticket["paid_amount"]
-
-            # Merge surrogate keys cho fact_ticket
-            df_fact_ticket = (
-                df_ticket.merge(dim_movie, on="movie_id", how="inner")
-                .merge(dim_cinema, on="cinema_id", how="inner")
-                .merge(dim_room, on="room_id", how="inner")
-                .merge(dim_customer, on="customer_id", how="inner")
-                .merge(
-                    dim_pricing,
-                    on=[
-                        "ticket_format",
-                        "day_type",
-                        "time_slot",
-                        "customer_type",
-                        "discount_rate",
-                    ],
-                    how="inner",
-                )
-                .merge(dim_channel, on="channel_code", how="inner")
-            )
-
-            fact_ticket_cols = [
-                "date_key",
-                "time_key",
-                "movie_key",
-                "cinema_key",
-                "room_key",
-                "customer_key",
-                "pricing_key",
-                "channel_key",
-                "txn_id",
-                "qty",
-                "list_price",
-                "discount_amount",
-                "net_amount",
-                "is_anomaly",
-                "anomaly_type",
-            ]
-            df_fact_ticket = df_fact_ticket[
-                [c for c in fact_ticket_cols if c in df_fact_ticket.columns]
-            ]
-
-            # Chuẩn bị date_key và time_key cho F&B
-            df_fnb["date_key"] = (
-                pd.to_datetime(df_fnb["sale_date"])
-                .dt.strftime("%Y%m%d")
-                .astype(int)
-            )
-            sale_time_dt = pd.to_datetime(
-                df_fnb["sale_time"].astype(str), format="%H:%M:%S"
-            )
-            df_fnb["time_key"] = (
-                sale_time_dt.dt.hour * 100 + sale_time_dt.dt.minute
-            )
-
-            # Merge surrogate keys cho fact_fnb
-            df_fact_fnb = (
-                df_fnb.merge(dim_cinema, on="cinema_id", how="inner")
-                .merge(dim_customer, on="customer_id", how="inner")
-                .merge(dim_product, on="product_id", how="inner")
-                .merge(dim_channel, on="channel_code", how="inner")
-            )
-
-            fact_fnb_cols = [
-                "date_key",
-                "time_key",
-                "cinema_key",
-                "customer_key",
-                "product_key",
-                "channel_key",
-                "txn_id",
-                "fnb_line_id",
-                "qty",
-                "unit_price",
-                "line_amount",
-                "is_anomaly",
-                "anomaly_type",
-            ]
-            df_fact_fnb = df_fact_fnb[
-                [c for c in fact_fnb_cols if c in df_fact_fnb.columns]
-            ]
-        else:
-            df_fact_ticket = df_ticket[
-                [c for c in cols_ticket if c in df_ticket.columns]
-            ]
-            df_fact_fnb = df_fnb
-
-        # Xóa dữ liệu cũ trước khi nạp lại để đảm bảo tính toàn vẹn (idempotent)
         with engine.begin() as conn:
+            for idx, stmt in enumerate(statements, 1):
+                # Nhận diện mục đích câu lệnh để log
+                upper_stmt = stmt.upper()
+                if "TRUNCATE" in upper_stmt:
+                    label = "TRUNCATE fact_ticket, fact_fnb"
+                elif "INSERT INTO" in upper_stmt and "FACT_TICKET" in upper_stmt:
+                    label = "INSERT INTO fact_ticket (JOIN 8 dims)"
+                elif "INSERT INTO" in upper_stmt and "FACT_FNB" in upper_stmt:
+                    label = "INSERT INTO fact_fnb (JOIN 6 dims + WHERE EXISTS ticket)"
+                else:
+                    label = f"Câu lệnh {idx}"
+
+                logger.info("  [%d/%d] Đang thực thi: %s...", idx, len(statements), label)
+                conn.execute(text(stmt))
+
+            # Lấy số dòng nạp thực tế
+            cnt_ticket = conn.execute(text("SELECT COUNT(*) FROM cinema_dw.fact_ticket")).scalar() or 0
+            cnt_fnb = conn.execute(text("SELECT COUNT(*) FROM cinema_dw.fact_fnb")).scalar() or 0
+            counts["fact_ticket"] = int(cnt_ticket)
+            counts["fact_fnb"] = int(cnt_fnb)
+
+            # Lấy số dòng staging để ghi nhật ký
+            stg_ticket = conn.execute(text("SELECT COUNT(*) FROM staging.ticket")).scalar() or 0
+            stg_fnb = conn.execute(text("SELECT COUNT(*) FROM staging.fnb")).scalar() or 0
+
+            # Ghi audit log vào cinema_dw.etl_log
             conn.execute(
-                text(
-                    f"TRUNCATE TABLE {target_schema}.fact_ticket RESTART IDENTITY CASCADE;"
-                )
-            )
-            conn.execute(
-                text(
-                    f"TRUNCATE TABLE {target_schema}.fact_fnb RESTART IDENTITY CASCADE;"
-                )
+                text("""
+                    INSERT INTO cinema_dw.etl_log 
+                        (run_id, step, src_rows, dwh_rows, status, message)
+                    VALUES 
+                        (:run_id, 'load_fact_ticket', :src_t, :dwh_t, 'OK', 'Nạp fact_ticket bằng SQL set-based thành công'),
+                        (:run_id, 'load_fact_fnb', :src_f, :dwh_f, 'OK', 'Nạp fact_fnb bằng SQL set-based thành công')
+                """),
+                {
+                    "run_id": run_id,
+                    "src_t": stg_ticket,
+                    "dwh_t": cnt_ticket,
+                    "src_f": stg_fnb,
+                    "dwh_f": cnt_fnb,
+                },
             )
 
-        # Nạp dữ liệu vào PostgreSQL
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "=== NẠP FACT HOÀN TẤT (%.2fs): fact_ticket=%s dòng | fact_fnb=%s dòng ===",
+            elapsed, f"{counts['fact_ticket']:,}", f"{counts['fact_fnb']:,}"
+        )
+        return counts
+
+    except Exception as exc:
+        logger.error("Lỗi khi nạp fact tables: %s (Đã tự động rollback transaction)", exc)
+        # Ghi log thất bại nếu có thể mở kết nối mới
         try:
-            df_fact_ticket.to_sql(
-                "fact_ticket",
-                con=engine,
-                schema=target_schema,
-                if_exists="append",
-                index=False,
-                method=psql_insert_copy,
-            )
-            df_fact_fnb.to_sql(
-                "fact_fnb",
-                con=engine,
-                schema=target_schema,
-                if_exists="append",
-                index=False,
-                method=psql_insert_copy,
-            )
+            with engine.begin() as conn_fail:
+                conn_fail.execute(
+                    text("""
+                        INSERT INTO cinema_dw.etl_log 
+                            (run_id, step, status, message)
+                        VALUES 
+                            (:run_id, 'load_facts', 'FAIL', :msg)
+                    """),
+                    {"run_id": run_id, "msg": str(exc)[:500]},
+                )
         except Exception:
-            df_fact_ticket.to_sql(
-                "fact_ticket",
-                con=engine,
-                schema=target_schema,
-                if_exists="append",
-                index=False,
-                chunksize=5000,
-            )
-            df_fact_fnb.to_sql(
-                "fact_fnb",
-                con=engine,
-                schema=target_schema,
-                if_exists="append",
-                index=False,
-                chunksize=5000,
-            )
+            pass
+        raise
 
-        # 5. In ra terminal số lượng dòng đã nạp thành công để đối soát nhanh
-        print(
-            f"Số lượng dòng đã nạp thành công vào fact_ticket: {len(df_fact_ticket):,}"
-        )
-        print(
-            f"Số lượng dòng đã nạp thành công vào fact_fnb: {len(df_fact_fnb):,}"
-        )
 
+def main() -> None:
+    """Hàm main duy trì tương thích cho các script gọi cũ."""
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+    try:
+        counts = load_facts()
+        # Giữ đúng format in terminal ban đầu
+        print(f"Số lượng dòng đã nạp thành công vào fact_ticket: {counts['fact_ticket']:,}")
+        print(f"Số lượng dòng đã nạp thành công vào fact_fnb: {counts['fact_fnb']:,}")
     except Exception as exc:
         print(f"Lỗi trong quá trình nạp dữ liệu: {exc}")
         sys.exit(1)

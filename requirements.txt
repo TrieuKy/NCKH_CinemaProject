@@ -1,12 +1,33 @@
-pandas
-numpy
-sqlalchemy
-psycopg2-binary
-python-dotenv
-apscheduler
-pytest
+# =============================================================================
+# CINEMA_PROJECT - Python Dependencies
+# Đề tài: Hệ thống phân tích hành vi khách hàng & Hỗ trợ ra quyết định rạp phim
+# =============================================================================
 
-# Module Reviews (Phân tích đánh giá Google Maps)
+# 1. Nền tảng Dữ liệu & Data Warehouse (PostgreSQL)
+pandas>=2.0.0
+numpy>=1.24.0
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0
+python-dotenv>=1.0.0
+
+# 2. Tiện ích & Lịch Việt Nam
+lunarcalendar>=0.0.9
+apscheduler>=3.10.0
+
+# 3. Phân tích & Học máy (Machine Learning)
+scikit-learn>=1.3.0
+xgboost>=2.0.0
+prophet>=1.1.5
+
+# 4. Giao diện người dùng & Trực quan hóa (Streamlit App)
+streamlit>=1.30.0
+plotly>=5.18.0
+bcrypt>=4.0.0
+
+# 5. Kiểm thử tự động
+pytest>=7.4.0
+
+# 6. Module Reviews (Thu thập & Khai phá đánh giá Google Maps)
 apify-client>=1.6.0
-# Tùy chọn nâng cao (NLP tiếng Việt sâu hơn):
+# Tùy chọn nâng cao (NLP tiếng Việt chuyên sâu, có fallback từ điển nếu chưa cài):
 underthesea>=6.8.0
