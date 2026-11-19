@@ -138,7 +138,7 @@ LEFT JOIN fnb_txns f ON t.date_key = f.date_key AND t.cinema_key = f.cinema_key 
 
 COMMENT ON VIEW cinema_dw.vw_fnb_attach IS 'Phân tích Attach Rate và SPP của F&B.';
 COMMENT ON COLUMN cinema_dw.vw_fnb_attach.attach_rate IS 'Tỷ lệ giao dịch F&B trên tổng giao dịch vé (fnb_txn_count / ticket_txn_count).';
-COMMENT ON COLUMN cinema_dw.vw_fnb_attach.spp_clean IS 'Spend Per Patron/Transaction = fnb_revenue_clean / ticket_txn_count (do GUEST không định danh, dùng số giao dịch vé làm mẫu số).';
+COMMENT ON COLUMN cinema_dw.vw_fnb_attach.spp_clean IS 'F&B Spend Per Ticket Transaction = fnb_revenue_clean / ticket_txn_count (do GUEST không định danh, mẫu số là số giao dịch vé, khác với SPP trên từng vé/khách).';
 COMMENT ON COLUMN cinema_dw.vw_fnb_attach.combo_attach_rate IS 'Tỷ lệ giao dịch vé có mua combo.';
 
 

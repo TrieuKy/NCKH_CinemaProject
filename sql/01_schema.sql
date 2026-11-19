@@ -4,7 +4,7 @@
 -- Schema: cinema_dw
 --
 -- Hạt nhân:
---   fact_ticket : 1 hàng = 1 giao dịch x loại ghế
+--   fact_ticket : 1 hàng = 1 giao dịch bán vé cho một suất chiếu (chứa 1..N vé biểu diễn qua qty)
 --   fact_fnb    : 1 hàng = 1 dòng sản phẩm trong 1 giao dịch
 -- Cả hai fact đều có txn_id để nối vé ↔ bắp nước.
 -- =============================================================================
@@ -152,7 +152,7 @@ CREATE TABLE IF NOT EXISTS fact_ticket (
     customer_key      INTEGER      NOT NULL REFERENCES dim_customer (customer_key),
     pricing_key       INTEGER      NOT NULL REFERENCES dim_pricing (pricing_key),
     channel_key       INTEGER      NOT NULL REFERENCES dim_channel (channel_key),
-    txn_id            VARCHAR(20)  NOT NULL UNIQUE,     -- degenerate: nối fact_fnb, 1 giao dịch x loại ghế = 1 dòng
+    txn_id            VARCHAR(20)  NOT NULL UNIQUE,     -- degenerate: nối fact_fnb, 1 giao dịch bán vé cho 1 suất chiếu = 1 dòng (qty = số vé)
     qty               SMALLINT     NOT NULL DEFAULT 1 CHECK (qty >= 0),
     list_price        NUMERIC(12, 0) NOT NULL,
     discount_amount   NUMERIC(12, 0) NOT NULL,
@@ -162,7 +162,7 @@ CREATE TABLE IF NOT EXISTS fact_ticket (
     loaded_at         TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-COMMENT ON TABLE fact_ticket IS 'Fact vé — grain 1 giao dịch x loại ghế. txn_id duy nhất, nối fact_fnb và POS.';
+COMMENT ON TABLE fact_ticket IS 'Fact vé — grain 1 giao dịch bán vé cho một suất chiếu. txn_id duy nhất, nối fact_fnb và POS.';
 COMMENT ON COLUMN fact_ticket.txn_id IS 'Mã giao dịch POS/APP/WEB, UNIQUE, dùng JOIN fact_fnb.';
 
 CREATE INDEX IF NOT EXISTS idx_fact_ticket_date   ON fact_ticket (date_key);

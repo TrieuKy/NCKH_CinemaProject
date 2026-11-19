@@ -10,9 +10,12 @@ Bạn đang hoàn thành **Bước 1 + Bước 2**. Bước ETL (nạp CSV vào 
 
 | File | Việc của file |
 |------|----------------|
-| `docs/assumptions.md` | Luật sinh dữ liệu — mang đi bảo vệ đồ án |
+| `docs/assumptions.md` | Luật sinh dữ liệu — mang đi bảo vệ đồ án (Hợp đồng dữ liệu) |
+| `docs/kpi_dictionary.md` | Từ điển KPI chuẩn hóa (công thức, grain, raw vs clean, SPP/SPT) |
+| `docs/data_dictionary.md` | Từ điển dữ liệu Star Schema, Staging và Summary tables |
+| `docs/data_lineage.md` | Sơ đồ dòng chảy dữ liệu toàn hệ thống |
 | `scripts/generate_mock_data.py` | Pandas/Numpy sinh CSV + nhãn `is_anomaly` |
-| `data/staging_ticket.csv` | Vé thô (1 dòng = 1 ghế) |
+| `data/staging_ticket.csv` | Vé thô (1 dòng = 1 giao dịch vé, biểu diễn số vé qua `qty`) |
 | `data/staging_fnb.csv` | Bắp nước thô, chung `txn_id` |
 | `sql/01_schema.sql` | Star schema PostgreSQL |
 
@@ -28,12 +31,12 @@ pip install -r requirements.txt
 python scripts/generate_mock_data.py
 ```
 
-3. Script tự kiểm tra: 3 rạp CGV (Landmark 81, Vincom Đồng Khởi, Pearl Plaza), 18 tháng, khách vãng lai ~70%, anomaly 1–2%, F&B không mồ côi, không vượt capacity trừ `qty_spike`.
+3. Script tự kiểm tra: 3 rạp CGV (Landmark 81, Vincom Đồng Khởi, Pearl Plaza), 12 tháng (2025-10-01 → 2026-09-30), khách vãng lai ~70%, anomaly 1–2%, F&B không mồ côi, không vượt capacity trừ `qty_spike`.
 4. Mở CSV bằng Excel hoặc Python, lọc `is_anomaly = 1` để thấy 3 loại lỗi.
 
 ### Gợi ý báo cáo (BA)
 
-- Grain là gì? Vì sao vé không gộp theo giao dịch?
+- Grain là gì? Phân biệt số dòng giao dịch (`COUNT(*)`) và tổng số vé bán ra (`SUM(qty)`).
 - Vì sao `GUEST` chỉ là **một** khách? (tránh RFM giả)
 - Vì sao cố ý gieo 1–2% lỗi? (huấn luyện cảnh báo, use case “Xem và xác nhận cảnh báo bất thường”)
 

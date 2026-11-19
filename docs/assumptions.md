@@ -1,12 +1,18 @@
-# Giả định sinh dữ liệu (Mock Data) — Giai đoạn 2
+# Giả định sinh dữ liệu (Mock Data) — Giai đoạn 2 (Chuẩn hóa Task 5)
 
-Tài liệu này là **hợp đồng dữ liệu** giữa BA/DA và kỹ thuật. Mọi luật dưới đây được cài trong `scripts/generate_mock_data.py`. Khi báo cáo NCKH, dẫn file này thay vì mô tả miệng.
+Tài liệu này là **hợp đồng dữ liệu (Data Contract)** giữa BA/DA, Data Architect và Kỹ thuật. Mọi quy luật dưới đây được cài đặt và vận hành trực tiếp trong mã nguồn `scripts/generate_mock_data.py`, `sql/01_schema.sql`, `sql/02_seed_dims.sql`, `sql/03_load_facts.sql`. Khi báo cáo NCKH, dẫn file này làm nguồn sự thật chính thức.
 
-Khoảng thời gian: **2025-04-01 → 2026-09-30** (18 tháng, nằm trong khung 12–24 tháng).
-Khối lượng mock: occupancy thực tế nhân `VOLUME_SCALE = 1.0` trong script để có khối lượng dữ liệu thật. Kỳ vọng: ~1.236.204 dòng vé, ~535.211 dòng F&B, ~16.925 suất chiếu. Occupancy trung bình ~59%, với khoảng 174 suất có occupancy_raw > 100% do lỗi qty_spike. Tỷ lệ tương đối giữa sáng/tối, ngày thường/cuối tuần vẫn giữ nguyên.
-Hạt nhân (grain) vé: **1 dòng = 1 ghế / 1 vé**.
-Hạt nhân F&B: **1 dòng = 1 sản phẩm trong 1 giao dịch**.
-Khóa nối vé ↔ bắp nước: **`txn_id`**.
+> [!NOTE] CẬP NHẬT PHIÊN BẢN (TASK 5):
+> - **Khoảng thời gian giao dịch thực tế:** **2025-10-01 → 2026-09-30 (12 tháng tròn)**, theo đúng cấu hình `START` và `END` trong `scripts/generate_mock_data.py`. (Tài liệu sơ khởi từng ghi nhận kỳ vọng thiết kế 18 tháng từ 2025-04-01, nay được chuẩn hóa theo mã nguồn thực thi).
+> - **Chiều ngày mở rộng (`dim_date`):** Bảng `dim_date` được khởi tạo ban đầu cho 12 tháng (`2025-10-01 → 2026-09-30`), sau đó được mở rộng tự động đến `2027-12-31` bằng script `etl/extend_dim_date.py` nhằm phục vụ mô hình Dự báo nhu cầu tương lai.
+> - **Khối lượng dữ liệu quan sát thực tế (với SEED=42, VOLUME_SCALE=1.0):**
+>   - Giao dịch vé: **458.804 dòng** (`staging.ticket` và `fact_ticket`).
+>   - Tổng số vé thực tế (`SUM(qty)`): **852.878 vé**.
+>   - Dòng F&B thực tế: **355.417 dòng** (`staging.fnb` và `fact_fnb`).
+>   - *(Số liệu thiết kế ước lượng ban đầu ở khung 18 tháng là ~1.236.204 vé, ~535.211 dòng F&B)*.
+> - **Hạt nhân (Grain) vé chính thức:** **Một dòng `fact_ticket` tương ứng một giao dịch bán vé cho một suất chiếu. Giao dịch có thể chứa nhiều vé, được biểu diễn bởi `qty` ($1 \le \text{qty} \le 4$).**
+> - **Hạt nhân (Grain) F&B:** **Một dòng `fact_fnb` tương ứng một dòng sản phẩm F&B thuộc một giao dịch.**
+> - **Khóa nối vé ↔ bắp nước:** **`txn_id`** (Degenerate Dimension trên cả hai bảng fact).
 
 Seed ngẫu nhiên: **`42`** (chạy lại script ra cùng kết quả).
 
@@ -62,6 +68,10 @@ Hệ số lấp đầy theo rạp: Landmark 81 ×1.08, Vincom Đồng Khởi ×1
 ### 2.3. Phân khúc tiềm ẩn của hội viên (Latent Segments) — Đánh giá Ground Truth (T1b)
 
 Để mô phỏng chân thực hành vi hội viên và đối chuẩn mô hình phân cụm K-Means, mỗi hội viên được gán một phân khúc tiềm ẩn (lưu tại `data/latent_labels.csv`, **không** đưa vào DWH).
+
+> [!IMPORTANT] NGUYÊN TẮC SỬ DỤNG GROUND TRUTH TRONG MÔ HÌNH HÓA (ML GOVERNANCE):
+> - File `data/latent_labels.csv` chỉ được sử dụng làm **Ground Truth** độc lập trong script đánh giá `scripts/eval_rfm.py` (tính các chỉ số Adjusted Rand Index - ARI, Purity, Confusion Matrix).
+> - **Tuyệt đối không đưa các nhãn tiềm ẩn này vào không gian đặc trưng huấn luyện (Feature Space) của thuật toán phân cụm K-Means** trong `core/rfm.py` nhằm đảm bảo tính khách quan và khoa học của đề tài nghiên cứu. Mô hình K-Means chỉ học thuần túy từ 4 đặc trưng hành vi thực tế: Recency, Frequency, Monetary, và Tenure.
 
 | Phân khúc tiềm ẩn | Tỷ lệ (%) | Tần suất/năm TB | Cửa sổ hoạt động | Thể loại ưa thích | Phòng ưa thích | Xác suất mua Combo |
 | :--- | :---: | :---: | :--- | :--- | :---: | :---: |
@@ -135,21 +145,28 @@ Giảm giá (cộng dồn, trần 35%):
 - MEMBER Standard: −5%; Silver: −8%; Gold: −12%.
 - WALK_IN: 0% (trừ suất sáng).
 
-Công thức đúng:
+Công thức tính toán giao dịch vé:
 
-```
-discount_amount = round(list_price * discount_rate)
-paid_amount     = list_price - discount_amount
-qty             = 1
-```
+- `list_price`: Đơn giá niêm yết của một vé đơn lẻ.
+- `per_ticket_discount = round(list_price * discount_rate)`: Số tiền giảm trên 1 vé.
+- `per_ticket_paid = list_price - per_ticket_discount`: Số tiền thực trả trên 1 vé.
+- `discount_amount = per_ticket_discount * qty`: Tổng giảm giá của cả giao dịch.
+- `paid_amount` (staging) = `net_amount` (DWH `fact_ticket`) = `per_ticket_paid * qty`: Tổng tiền thực thanh toán của cả giao dịch.
+- `qty`: Số vé mua trong giao dịch ($1 \le \text{qty} \le 4$).
 
 ---
 
-## 5. Vé theo giao dịch
+## 5. Vé theo giao dịch (Transaction Grain & Party Size)
 
-- Mỗi `txn_id` nhóm 1–4 ghế cùng suất (45% / 35% / 15% / 5%).
-- `txn_id` dạng `TXN00000001`; `ticket_id` dạng `TKT00000001`.
-- Ghế: `A1`, `A2`, … không trùng trong cùng suất.
+- **Grain chuẩn của `fact_ticket`:** **Một dòng = Một giao dịch bán vé cho một suất chiếu.** Giao dịch chứa từ 1 đến 4 vé (đại diện bởi `qty`).
+- Khóa định danh: Duy nhất `txn_id` dạng `TXN00000001` (cột `txn_id` có ràng buộc UNIQUE trên `fact_ticket`, không sinh mã `ticket_id` theo từng ghế lẻ).
+- Phân phối nhóm khách (`party = qty`):
+  - 1 vé: 45%
+  - 2 vé: 35%
+  - 3 vé: 15%
+  - 4 vé: 5%
+- `COUNT(*)` trên `fact_ticket`: Đếm số lượng giao dịch vé (`ticket_txns`).
+- `SUM(qty)` trên `fact_ticket`: Đếm tổng số lượng vé bán ra (`tickets_sold`).
 
 ---
 
@@ -222,8 +239,13 @@ UTF-8, dấu phẩy, header. Staging **denormalize** để bài ETL tách Dimens
 | `product_*` | `dim_product` |
 | format + day_type + time_slot + giá | `dim_pricing` |
 | `channel_code` | `dim_channel` |
-| mỗi ghế / mỗi dòng SP | `fact_ticket` / `fact_fnb` |
+| mỗi giao dịch vé / mỗi dòng SP F&B | `fact_ticket` / `fact_fnb` |
 | `txn_id` | degenerate dimension trên cả hai fact |
+
+> [!WARNING] NGUYÊN TẮC JOIN FACT_TICKET VÀ FACT_FNB (TRÁNH DOUBLE COUNTING):
+> - Một giao dịch vé (`fact_ticket.txn_id`) có thể có $0, 1$ hoặc nhiều dòng F&B (`fact_fnb`).
+> - **Tuyệt đối không JOIN trực tiếp `fact_ticket` với `fact_fnb`** trong các truy vấn phân tích tổng hợp số lượng vé, doanh thu vé hoặc occupancy vì sẽ gây nhân bản số dòng (Cartesian fan-out) và làm sai lệch số liệu (Double Counting).
+> - Khi cần tính các chỉ số kết hợp (như Attach Rate, F&B Spend per Ticket Transaction), bắt buộc phải tổng hợp (aggregate) riêng từng bảng theo cùng grain (ví dụ: ngày × rạp × khung giờ) trước khi thực hiện phép JOIN.
 
 ---
 
