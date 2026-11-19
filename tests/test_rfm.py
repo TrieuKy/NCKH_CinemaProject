@@ -275,3 +275,196 @@ def test_empty_dataframe_handling():
     assert "frequency" in rfm.columns
     assert "monetary" in rfm.columns
     assert "tenure" in rfm.columns
+
+
+# ==============================================================================
+# BỔ SUNG CÁC TEST KIỂM ĐỊNH KHOA HỌC (TASK 6 - VALIDATION)
+# ==============================================================================
+
+def test_frequency_single_txn_multiple_tickets():
+    """
+    Kiểm định: Frequency đếm số txn_id duy nhất, không bị nhân đôi theo số vé (qty).
+    Ví dụ: Một giao dịch mua 4 vé (qty=4) chỉ tính frequency = 1.
+    """
+    tickets = pd.DataFrame([
+        {
+            "customer_key": 10, "customer_id": "CUS010", "txn_id": "TXN_PARTY_4",
+            "qty": 4, "net_amount": 400_000, "full_date": date(2026, 8, 1),
+            "is_anomaly": 0, "is_guest": False
+        }
+    ])
+    rfm = compute_rfm_metrics(tickets, reference_date=date(2026, 9, 30))
+    assert len(rfm) == 1
+    row = rfm.iloc[0]
+    assert row["frequency"] == 1, "Frequency phải là 1 (theo txn_id), không được là 4 (theo số vé)"
+    assert row["monetary"] == 400_000
+
+
+def test_monetary_single_txn_multiple_fnb_lines():
+    """
+    Kiểm định: Monetary cộng đúng doanh thu vé và nhiều dòng F&B, không nhân đôi khi JOIN.
+    Ví dụ: 1 giao dịch vé 100k + 3 dòng F&B (45k, 39k, 99k) -> Monetary = 283k, F = 1.
+    """
+    tickets = pd.DataFrame([
+        {
+            "customer_key": 20, "customer_id": "CUS020", "txn_id": "TXN_MULTI_FNB",
+            "net_amount": 100_000, "full_date": date(2026, 9, 1),
+            "is_anomaly": 0, "is_guest": False
+        }
+    ])
+    fnb = pd.DataFrame([
+        {
+            "customer_key": 20, "customer_id": "CUS020", "txn_id": "TXN_MULTI_FNB",
+            "line_amount": 45_000, "full_date": date(2026, 9, 1),
+            "is_anomaly": 0, "is_guest": False
+        },
+        {
+            "customer_key": 20, "customer_id": "CUS020", "txn_id": "TXN_MULTI_FNB",
+            "line_amount": 39_000, "full_date": date(2026, 9, 1),
+            "is_anomaly": 0, "is_guest": False
+        },
+        {
+            "customer_key": 20, "customer_id": "CUS020", "txn_id": "TXN_MULTI_FNB",
+            "line_amount": 99_000, "full_date": date(2026, 9, 1),
+            "is_anomaly": 0, "is_guest": False
+        },
+    ])
+    rfm = compute_rfm_metrics(tickets, fnb, reference_date=date(2026, 9, 30))
+    assert len(rfm) == 1
+    row = rfm.iloc[0]
+    expected_monetary = 100_000 + 45_000 + 39_000 + 99_000
+    assert row["monetary"] == expected_monetary, f"Monetary phải là {expected_monetary}, thực tế: {row['monetary']}"
+    assert row["frequency"] == 1, "Cùng txn_id giữa vé và 3 dòng F&B chỉ được tính frequency = 1"
+
+
+def test_guest_customers_strictly_excluded():
+    """Kiểm định: Khách GUEST (vãng lai) bị loại hoàn toàn khỏi phân tích RFM cá nhân."""
+    tickets = pd.DataFrame([
+        {
+            "customer_key": 1, "customer_id": "GUEST", "txn_id": "TXN_G1",
+            "net_amount": 200_000, "full_date": date(2026, 9, 1),
+            "is_anomaly": 0, "is_guest": True
+        },
+        {
+            "customer_key": 2, "customer_id": "CUS002", "txn_id": "TXN_M1",
+            "net_amount": 100_000, "full_date": date(2026, 9, 1),
+            "is_anomaly": 0, "is_guest": False
+        }
+    ])
+    rfm = compute_rfm_metrics(tickets, reference_date=date(2026, 9, 30))
+    assert len(rfm) == 1
+    assert "GUEST" not in rfm["customer_id"].values
+    assert rfm.iloc[0]["customer_id"] == "CUS002"
+
+
+def test_anomaly_transactions_excluded_cleanly():
+    """Kiểm định: Các giao dịch có is_anomaly = 1 bị loại bỏ ở cả vé và F&B."""
+    tickets = pd.DataFrame([
+        {
+            "customer_key": 30, "customer_id": "CUS030", "txn_id": "TXN_OK",
+            "net_amount": 80_000, "full_date": date(2026, 9, 10),
+            "is_anomaly": 0, "is_guest": False
+        },
+        {
+            "customer_key": 30, "customer_id": "CUS030", "txn_id": "TXN_ANOM",
+            "net_amount": 999_999_999, "full_date": date(2026, 9, 20),
+            "is_anomaly": 1, "is_guest": False
+        }
+    ])
+    fnb = pd.DataFrame([
+        {
+            "customer_key": 30, "customer_id": "CUS030", "txn_id": "TXN_OK",
+            "line_amount": 50_000, "full_date": date(2026, 9, 10),
+            "is_anomaly": 0, "is_guest": False
+        },
+        {
+            "customer_key": 30, "customer_id": "CUS030", "txn_id": "TXN_ANOM",
+            "line_amount": 500_000_000, "full_date": date(2026, 9, 20),
+            "is_anomaly": 1, "is_guest": False
+        }
+    ])
+    rfm = compute_rfm_metrics(tickets, fnb, reference_date=date(2026, 9, 30))
+    assert len(rfm) == 1
+    row = rfm.iloc[0]
+    assert row["frequency"] == 1
+    assert row["monetary"] == 80_000 + 50_000
+    assert row["recency_days"] == 20  # 2026-09-30 - 2026-09-10 = 20 (bỏ qua ngày 20)
+
+
+def test_customer_without_fnb_handled_cleanly():
+    """Kiểm định: Khách hàng không mua F&B có monetary = net_amount vé và không bị NaN."""
+    tickets = pd.DataFrame([
+        {
+            "customer_key": 40, "customer_id": "CUS040", "txn_id": "TXN_NO_FNB",
+            "net_amount": 120_000, "full_date": date(2026, 9, 15),
+            "is_anomaly": 0, "is_guest": False
+        }
+    ])
+    # Không truyền df_fnb
+    rfm_no_fnb_arg = compute_rfm_metrics(tickets, df_fnb=None, reference_date=date(2026, 9, 30))
+    assert len(rfm_no_fnb_arg) == 1
+    assert rfm_no_fnb_arg.iloc[0]["monetary"] == 120_000
+    assert not rfm_no_fnb_arg.isna().any().any()
+
+    # Truyền df_fnb rỗng
+    rfm_empty_fnb = compute_rfm_metrics(tickets, df_fnb=pd.DataFrame(), reference_date=date(2026, 9, 30))
+    assert len(rfm_empty_fnb) == 1
+    assert rfm_empty_fnb.iloc[0]["monetary"] == 120_000
+    assert not rfm_empty_fnb.isna().any().any()
+
+
+def test_single_transaction_customer_tenure_and_features():
+    """Kiểm định: Khách hàng chỉ có 1 giao dịch có tenure = 0 và không gây lỗi log1p/scaling."""
+    tickets = pd.DataFrame([
+        {
+            "customer_key": 50, "customer_id": "CUS050", "txn_id": "TXN_SINGLE",
+            "net_amount": 95_000, "full_date": date(2026, 9, 25),
+            "is_anomaly": 0, "is_guest": False
+        }
+    ])
+    rfm = compute_rfm_metrics(tickets, reference_date=date(2026, 9, 30))
+    assert len(rfm) == 1
+    row = rfm.iloc[0]
+    assert row["frequency"] == 1
+    assert row["tenure"] == 0
+    assert row["recency_days"] == 5
+
+    # Kiểm tra log1p và scaling không sinh NaN / Inf
+    features = rfm[["recency_days", "frequency", "monetary", "tenure"]].values
+    X_log = np.log1p(features)
+    assert not np.isnan(X_log).any()
+    assert not np.isinf(X_log).any()
+    assert X_log[0, 3] == 0.0  # log1p(0) == 0
+
+
+def test_no_latent_labels_leakage_into_training():
+    """Kiểm định: Không rò rỉ nhãn tiềm ẩn (latent_segment) vào không gian huấn luyện K-Means."""
+    df_rfm = pd.DataFrame([
+        {"customer_key": i, "customer_id": f"CUS_{i}", "recency_days": 10 + i * 5, "frequency": 2 + i * 2, "monetary": 200_000 + i * 100_000, "tenure": 10 + i * 20, "latent_segment": f"SEG_{i%3}"}
+        for i in range(15)
+    ])
+    # evaluate_kmeans_candidates chỉ được phép trích xuất đúng 4 đặc trưng hành vi
+    best_k, metrics, X_scaled = evaluate_kmeans_candidates(df_rfm, k_range=range(3, 4))
+    assert X_scaled.shape[1] == 4, "Không gian đặc trưng chỉ được gồm đúng 4 cột: R, F, M, Tenure"
+
+
+def test_kmeans_reproducibility_fixed_seed(synthetic_rfm_clusters):
+    """Kiểm định: Tính tái lập 100% của K-Means khi cố định random_state."""
+    _, _, X_scaled_1 = evaluate_kmeans_candidates(synthetic_rfm_clusters, k_range=range(3, 4), random_state=42)
+    _, _, X_scaled_2 = evaluate_kmeans_candidates(synthetic_rfm_clusters, k_range=range(3, 4), random_state=42)
+    np.testing.assert_array_almost_equal(X_scaled_1, X_scaled_2)
+
+    df_clustered_1, _ = cluster_rfm_customers(synthetic_rfm_clusters, 4, X_scaled_1, random_state=42)
+    df_clustered_2, _ = cluster_rfm_customers(synthetic_rfm_clusters, 4, X_scaled_2, random_state=42)
+    pd.testing.assert_series_equal(df_clustered_1["cluster_id"], df_clustered_2["cluster_id"])
+
+
+def test_insufficient_data_raises_value_error():
+    """Kiểm định: Xử lý an toàn khi số lượng khách hàng nhỏ hơn k tối đa."""
+    small_df = pd.DataFrame([
+        {"customer_key": 1, "customer_id": "CUS1", "recency_days": 10, "frequency": 2, "monetary": 200_000, "tenure": 20},
+        {"customer_key": 2, "customer_id": "CUS2", "recency_days": 20, "frequency": 1, "monetary": 100_000, "tenure": 0},
+    ])
+    with pytest.raises(ValueError, match="nhỏ hơn k tối đa"):
+        evaluate_kmeans_candidates(small_df, k_range=range(3, 7))
+
