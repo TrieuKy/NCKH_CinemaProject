@@ -230,13 +230,15 @@ def test_dry_run_executes_zero_write_statements(db_engine):
 # 5. ADVISORY LOCK TESTS
 # =============================================================================
 
+TEST_LOCK_ID = 9876543210123456
+
 def test_advisory_lock_prevents_concurrent_runs(db_engine):
     """Kiểm tra: Hai phiên full pipeline không thể chạy đồng thời nhờ PostgreSQL Advisory Lock."""
     # Phiên 1 giữ khóa độc quyền
-    with acquire_pipeline_lock(db_engine, lock_id=ETL_ADVISORY_LOCK_ID, shared=False):
+    with acquire_pipeline_lock(db_engine, lock_id=TEST_LOCK_ID, shared=False):
         # Phiên 2 cố gắng lấy khóa trong khi Phiên 1 đang giữ
         with pytest.raises(RuntimeError) as exc_info:
-            with acquire_pipeline_lock(db_engine, lock_id=ETL_ADVISORY_LOCK_ID, shared=False):
+            with acquire_pipeline_lock(db_engine, lock_id=TEST_LOCK_ID, shared=False):
                 pass
         assert "Một phiên ETL khác đang chạy" in str(exc_info.value)
 
@@ -244,22 +246,22 @@ def test_advisory_lock_prevents_concurrent_runs(db_engine):
 def test_advisory_lock_released_on_exception(db_engine):
     """Kiểm tra: Khóa advisory lock được giải phóng tự động khi có Exception xảy ra."""
     try:
-        with acquire_pipeline_lock(db_engine, lock_id=ETL_ADVISORY_LOCK_ID, shared=False):
+        with acquire_pipeline_lock(db_engine, lock_id=TEST_LOCK_ID, shared=False):
             raise ArithmeticError("Mô phỏng lỗi crash trong pipeline")
     except ArithmeticError:
         pass
 
     # Kiểm tra ngay sau đó: có thể lấy khóa lại thành công (không bị kẹt khóa)
-    with acquire_pipeline_lock(db_engine, lock_id=ETL_ADVISORY_LOCK_ID, shared=False):
+    with acquire_pipeline_lock(db_engine, lock_id=TEST_LOCK_ID, shared=False):
         # Lấy khóa thành công
         assert True
 
 
 def test_reconcile_only_blocked_by_full_pipeline_lock(db_engine):
     """Kiểm tra: Chế độ --reconcile-only không thể chạy nếu full pipeline đang ghi dữ liệu."""
-    with acquire_pipeline_lock(db_engine, lock_id=ETL_ADVISORY_LOCK_ID, shared=False):
+    with acquire_pipeline_lock(db_engine, lock_id=TEST_LOCK_ID, shared=False):
         with pytest.raises(RuntimeError) as exc_info:
-            with acquire_pipeline_lock(db_engine, lock_id=ETL_ADVISORY_LOCK_ID, shared=True):
+            with acquire_pipeline_lock(db_engine, lock_id=TEST_LOCK_ID, shared=True):
                 pass
         assert "Một phiên ETL khác đang chạy" in str(exc_info.value)
 
