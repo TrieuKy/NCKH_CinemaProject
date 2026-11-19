@@ -1,5 +1,15 @@
 # Giai đoạn 2 — Hướng dẫn làm việc (sinh viên / BA–DA)
 
+> [!NOTE] TÀI LIỆU LỊCH SỬ DỰ ÁN (HISTORICAL GUIDELINES)
+> Tài liệu này được lập tại thời điểm khởi tạo **Giai đoạn 2 (Bước 1 & 2)** nhằm hướng dẫn sinh viên, BA và DA thiết lập giả định dữ liệu thô và dựng Star Schema DDL ban đầu.
+>
+> **Hiện trạng thực tế của dự án (Task 5 / Task 5.1):**
+> Toàn bộ các nội dung tại mục *"Bước tiếp theo (chưa làm trong lượt này)"* ở cuối tài liệu này (`sql/02_seed_dims.sql`, ETL nạp Fact `sql/03_load_facts.sql`, View KPI phân tích `sql/03_views.sql`, Đối soát QC 17 tests `etl/reconcile.py`, Tóm lược Summary `sql/05_app_tables.sql`, và Nền tảng ứng dụng Streamlit `app/main.py`) **đều đã được lập trình, kiểm thử và nghiệm thu hoàn tất**.
+>
+> Toàn bộ nội dung hướng dẫn nghiệp vụ, giải thích lý thuyết Kimball, định vị vai trò BA/DA và kỹ năng phỏng vấn dưới đây được **bảo lưu nguyên vẹn** nhằm phục vụ viết báo cáo Nghiên cứu Khoa học và bảo vệ đồ án.
+
+---
+
 Mục tiêu giai đoạn này: có **kho dữ liệu đa chiều** và **dữ liệu thô có kiểm soát**, không viết App.
 
 Bạn đang hoàn thành **Bước 1 + Bước 2**. Bước ETL (nạp CSV vào PostgreSQL) làm tiếp sau.
@@ -91,7 +101,20 @@ Chưa cần Spark/Airflow ở đồ án này. Khi mở rộng webview: cùng API
 
 ---
 
-## Bước tiếp theo (chưa làm trong lượt này)
+## Bước tiếp theo (Kế hoạch ban đầu & Hiện trạng đã hoàn thành)
+
+> [!NOTE] CẬP NHẬT TRẠNG THÁI HIỆN TẠI (TASK 5):
+> Toàn bộ 3 hạng mục dự kiến ban đầu dưới đây đã được triển khai hoàn chỉnh trong codebase:
+> 1. `sql/02_seed_dims.sql` (kết hợp `etl/seed_dims.py`): Đã nạp 9 Dimension an toàn với `ON CONFLICT DO NOTHING`.
+> 2. `sql/03_load_facts.sql` (kết hợp `etl/load_facts.py`): Đã nạp `fact_ticket` và `fact_fnb` với 8 dimension lookup (Set-based, Atomic transaction).
+> 3. `sql/03_views.sql`: Đã xây dựng 4 views phân tích (`vw_daily_kpi`, `vw_showtime_occupancy`, `vw_fnb_attach`, `vw_anomaly_showtime`).
+>
+> Ngoài ra, hệ thống đã mở rộng hoàn thành:
+> - Tầng đối soát chất lượng độc lập 17 bài test QC (`etl/reconcile.py`).
+> - Tầng tóm lược hiệu năng cao `fact_showtime_summary` và `fact_daily_cinema_summary` (`etl/aggregate_summary.py`).
+> - Pipeline phân khúc khách hàng RFM K-Means (`core/rfm.py`) và đánh giá Ground Truth (`scripts/eval_rfm.py`).
+> - Pipeline dự báo chuỗi thời gian Prophet/XGBoost (`core/forecast.py`).
+> - Nền tảng ứng dụng Streamlit UI-1 (`app/main.py`): xác thực bcrypt, phân quyền, filter bar dùng lại và thư viện linh kiện.
 
 1. `sql/02_seed_dims.sql` — nạp dim từ CSV distinct.
 2. Script ETL Python: staging → fact (lookup key).

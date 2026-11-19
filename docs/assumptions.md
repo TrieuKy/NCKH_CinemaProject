@@ -249,9 +249,9 @@ UTF-8, dấu phẩy, header. Staging **denormalize** để bài ETL tách Dimens
 
 ---
 
-## 11. Việc cố ý chưa làm ở bước sinh dữ liệu
+## 11. Việc cố ý chưa làm ở bước sinh dữ liệu (`scripts/generate_mock_data.py`)
 
-- Chưa load PostgreSQL (ETL bước sau).
-- Chưa RFM / clustering / forecast.
-- Chưa user App.
-- Không mô phỏng hoàn tiền / suất hủy.
+- **Không tự nạp vào PostgreSQL:** Quá trình sinh dữ liệu chỉ trích xuất ra các file CSV thô (`data/staging_ticket.csv`, `data/staging_fnb.csv`, `data/latent_labels.csv`); việc nạp kho thuộc trách nhiệm của pipeline ETL độc lập (`etl/load_staging.py`, `etl/load_facts.py`).
+- **Không thực hiện RFM / Forecast trực tiếp:** Quá trình sinh mock chỉ tạo nhãn latent độc lập; việc huấn luyện mô hình diễn ra ở các module riêng biệt `core/rfm.py` và `core/forecast.py`.
+- **Không quản lý người dùng ứng dụng:** Quản lý tài khoản ứng dụng được phân định tại bảng `cinema_dw.app_user` và `app/ui/auth.py`.
+- **Không mô phỏng hoàn tiền / suất hủy:** Phạm vi nghiên cứu tập trung vào suất chiếu hợp lệ và dòng tiền thực thu.

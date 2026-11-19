@@ -11,10 +11,11 @@
 
 Tài liệu này định nghĩa chuẩn mực toàn bộ các chỉ số đo lường hiệu quả hoạt động (Key Performance Indicators - KPIs) được cài đặt và vận hành trong hệ thống Data Warehouse (`cinema_dw`), các Views (`03_views.sql`), tầng tóm lược (`fact_showtime_summary`, `fact_daily_cinema_summary`), mô hình RFM (`core/rfm.py`) và mô hình dự báo nhu cầu (`core/forecast.py`).
 
-### 1.1. Nguyên tắc Raw vs Clean
-Nhằm phục vụ cả hai mục đích: (1) Phân tích vận hành chính xác và (2) Phát hiện / cảnh báo gian lận bất thường, hệ thống tách biệt hai luồng số liệu:
-- **Raw (Dữ liệu thô):** Bao gồm toàn bộ các dòng giao dịch phát sinh từ nguồn (kể cả các bản ghi có cờ `is_anomaly = 1`).
-- **Clean (Dữ liệu sạch):** Chỉ tính trên các bản ghi hợp lệ (`is_anomaly = 0`). Mọi KPI phục vụ báo cáo quản trị, phân khúc khách hàng (RFM) và huấn luyện dự báo (Forecasting) **bắt buộc** dùng dữ liệu Clean.
+### 1.1. Nguyên tắc Raw, Clean & Hybrid
+Nhằm phục vụ cả hai mục đích: (1) Phân tích vận hành chính xác và (2) Phát hiện / cảnh báo gian lận bất thường, hệ thống phân loại toàn bộ chỉ số thành 3 nhóm xử lý:
+1. **Chỉ sử dụng dữ liệu sạch (Clean Data Only):** Áp dụng bắt buộc điều kiện `is_anomaly = 0` trên toàn bộ các thành phần cấu thành (cả tử số và mẫu số). Mọi KPI phục vụ báo cáo quản trị cấp cao, phân khúc hội viên RFM (`core/rfm.py`) và huấn luyện dự báo (`core/forecast.py`) thuộc nhóm này (ví dụ: `ticket_revenue_clean`, `ticket_qty_clean`, `atp_clean`, `occupancy_clean`, `fnb_revenue_clean`).
+2. **Sử dụng toàn bộ giao dịch (Raw Data / All Transactions):** Sử dụng toàn bộ các bản ghi giao dịch phát sinh từ nguồn mà không áp dụng bộ lọc `is_anomaly = 0` (ví dụ: `ticket_txn_count`, `fnb_txn_count`, `combo_txn_count`, `attach_rate`, `combo_attach_rate`, `occupancy_raw`). **Tuyệt đối không gắn nhãn "Clean" cho nhóm chỉ số này.**
+3. **Chỉ số kết hợp (Hybrid Metrics):** Kết hợp giữa tử số dữ liệu sạch với mẫu số là tổng giao dịch thô (ví dụ: `spp_clean = fnb_revenue_clean / ticket_txn_count`). Dù tên cột mang hậu tố `_clean` để chỉ thành phần doanh thu F&B đã làm sạch, mẫu số giao dịch vé vẫn bao gồm toàn bộ giao dịch thô.
 
 ### 1.2. Nguyên tắc Grain & Tránh Double Counting
 - `fact_ticket`: Một dòng = Một giao dịch vé (`txn_id` là duy nhất). Số vé thực tế là `qty` (1–4 vé).
@@ -38,9 +39,9 @@ Nhằm phục vụ cả hai mục đích: (1) Phân tích vận hành chính xá
   ```
 - **Đơn vị đo:** Giao dịch (Transactions).
 - **Nguồn dữ liệu:** `cinema_dw.fact_ticket (txn_id)`.
-- **Quy tắc Raw/Clean:**
-  - Raw: `COUNT(DISTINCT txn_id)`
-  - Clean: `COUNT(DISTINCT CASE WHEN is_anomaly = 0 THEN txn_id END)`
+- **Quy tắc Raw/Clean & Phân loại:**
+  - **Sử dụng toàn bộ giao dịch (Raw):** Trong các view tổng hợp như `vw_fnb_attach` và bảng `fact_daily_cinema_summary`, `ticket_txn_count` được tính bằng `COUNT(DISTINCT txn_id)` trên toàn bộ bảng `fact_ticket` (không lọc `is_anomaly = 0`) nhằm phản ánh tổng số lượt thanh toán phát sinh trên hệ thống.
+  - Phân loại: **Nhóm 2 — Sử dụng toàn bộ giao dịch (Raw).**
 - **Xử lý mẫu số = 0:** Không áp dụng (chỉ số đếm).
 - **Hạn chế & Lưu ý:** Không được nhầm lẫn số giao dịch với tổng số vé bán ra (`Tickets Sold`). Một giao dịch gia đình/nhóm có thể mua từ 2 đến 4 vé.
 
@@ -159,9 +160,12 @@ Nhằm phục vụ cả hai mục đích: (1) Phân tích vận hành chính xá
   END AS attach_rate
   ```
   Trong đó:
-  - `ticket_txn_count`: `COUNT(DISTINCT txn_id)` từ `fact_ticket`.
-  - `fnb_txn_count`: `COUNT(DISTINCT txn_id)` từ `fact_fnb`.
+  - `ticket_txn_count`: `COUNT(DISTINCT txn_id)` từ `fact_ticket` (toàn bộ giao dịch thô).
+  - `fnb_txn_count`: `COUNT(DISTINCT txn_id)` từ `fact_fnb` (toàn bộ giao dịch thô).
 - **Đơn vị đo:** Tỷ lệ phần trăm ($0.0 \rightarrow 1.0$).
+- **Quy tắc Raw/Clean & Phân loại:**
+  - **Sử dụng toàn bộ giao dịch (Raw):** Cả tử số (`fnb_txn_count`) và mẫu số (`ticket_txn_count`) đều lấy toàn bộ giao dịch phát sinh từ hai bảng fact mà KHÔNG lọc điều kiện `is_anomaly = 0`.
+  - Phân loại: **Nhóm 2 — Sử dụng toàn bộ giao dịch (Raw).** Tuyệt đối không gắn nhãn "Clean" cho chỉ số này.
 - **Xử lý mẫu số = 0:** Kiểm tra `t.ticket_txn_count > 0`.
 - **Hạn chế & Lưu ý:** Tỷ lệ này đo lường trên cấp **Giao dịch (Transaction)**. Vì một giao dịch mua F&B có cùng `txn_id` với giao dịch vé, chỉ số thể hiện tỷ lệ % giao dịch vé có mua kèm F&B.
 
@@ -178,8 +182,13 @@ Nhằm phục vụ cả hai mục đích: (1) Phân tích vận hành chính xá
       ELSE 0 
   END AS combo_attach_rate
   ```
-  Trong đó: `combo_txn_count = COUNT(DISTINCT CASE WHEN p.is_combo THEN f.txn_id END)` với `p` là `dim_product`.
+  Trong đó:
+  - `ticket_txn_count`: `COUNT(DISTINCT txn_id)` từ `fact_ticket` (toàn bộ giao dịch thô).
+  - `combo_txn_count`: `COUNT(DISTINCT CASE WHEN p.is_combo THEN f.txn_id END)` với `p` là `dim_product` (toàn bộ giao dịch thô có combo).
 - **Đơn vị đo:** Tỷ lệ phần trăm ($0.0 \rightarrow 1.0$).
+- **Quy tắc Raw/Clean & Phân loại:**
+  - **Sử dụng toàn bộ giao dịch (Raw):** Cả tử số (`combo_txn_count`) và mẫu số (`ticket_txn_count`) đều lấy toàn bộ giao dịch từ hai bảng fact mà KHÔNG lọc điều kiện `is_anomaly = 0`.
+  - Phân loại: **Nhóm 2 — Sử dụng toàn bộ giao dịch (Raw).** Tuyệt đối không gắn nhãn "Clean" cho chỉ số này.
 - **Xử lý mẫu số = 0:** Kiểm tra `t.ticket_txn_count > 0`.
 
 ---
@@ -197,6 +206,13 @@ Nhằm phục vụ cả hai mục đích: (1) Phân tích vận hành chính xá
   ```
 - **Đơn vị đo:** VNĐ / Giao dịch vé (VNĐ/ticket transaction).
 - **Nguồn dữ liệu:** `fact_fnb (line_amount)`, `fact_ticket (txn_id)`.
+- **Quy tắc Raw/Clean & Phân loại:**
+  - **Chỉ số kết hợp (Hybrid Metric):**
+    * **Tử số:** `fnb_revenue_clean` là doanh thu F&B sạch đã lọc `is_anomaly = 0`.
+    * **Mẫu số:** `ticket_txn_count` là tổng giao dịch vé thô (`COUNT(DISTINCT txn_id)`), KHÔNG lọc `is_anomaly = 0`.
+  - Phân loại: **Nhóm 3 — Kết hợp mẫu số giao dịch raw với doanh thu F&B clean.**
+  - > [!IMPORTANT] LƯU Ý BẢN CHẤT CLEAN CỦA SPP_CLEAN:
+    > Dù tên cột trong mã nguồn mang hậu tố `_clean`, chỉ số này KHÔNG PHẢI chỉ số thuần sạch (Pure Clean) do mẫu số vẫn chứa toàn bộ các giao dịch vé thô. Khi lập báo cáo tài chính hoặc phân tích chuyên sâu, chuyên viên dữ liệu cần ghi chú rõ đặc tính kết hợp này.
 - **> [!WARNING] CẢNH BÁO NGUY CƠ HIỂU NHẦM NGHIỆP VỤ (SPP vs SPT):**
   - Trong thuật ngữ điện ảnh chuẩn quốc tế, **SPP (Spend Per Patron)** có mẫu số là **tổng số khách / số vé bán ra (`SUM(qty)`)**.
   - Tuy nhiên, trong mã nguồn `sql/03_views.sql` (L130, chú thích L141), mẫu số được sử dụng là **`ticket_txn_count` (tổng số giao dịch vé)** với lý do: *"Khách vãng lai GUEST chiếm 70% không định danh cá nhân, hệ thống chọn số giao dịch vé làm mẫu số chuẩn"*.
@@ -223,15 +239,30 @@ Nhằm phục vụ cả hai mục đích: (1) Phân tích vận hành chính xá
 
 ## 3. Tổng hợp Bảng Đối chiếu Chỉ số
 
-| Mã KPI | Tên chỉ số | Tên cột SQL | Grain | Tử số | Mẫu số | Bảo vệ mẫu số = 0 | Raw vs Clean |
-|:---|:---|:---|:---|:---|:---|:---:|:---:|
-| **KPI-01** | Ticket Transactions | `ticket_txn_count` | Ngày × Rạp × Giờ | `COUNT(DISTINCT txn_id)` | N/A | Không | Tách cờ |
-| **KPI-02** | Tickets Sold | `ticket_qty_clean` | Ngày × Rạp / Suất | `SUM(qty)` | N/A | Không | `is_anomaly = 0` |
-| **KPI-03** | Ticket Revenue | `ticket_revenue_clean` | Ngày × Rạp / Suất | `SUM(net_amount)` | N/A | Không | `is_anomaly = 0` |
-| **KPI-04** | Average Ticket Price | `atp_clean` | Ngày × Rạp | `ticket_revenue_clean` | `ticket_qty_clean` | `CASE > 0` | Dữ liệu sạch |
-| **KPI-05** | Showtime Occupancy | `occupancy_clean` | Suất chiếu | `SUM(qty_clean)` | `dr.capacity` | Cần `NULLIF` | Cả Raw & Clean |
-| **KPI-06** | F&B Revenue | `fnb_revenue_clean` | Ngày × Rạp × Giờ | `SUM(line_amount)` | N/A | Không | `is_anomaly = 0` |
-| **KPI-07** | F&B Attach Rate | `attach_rate` | Ngày × Rạp × Giờ | `fnb_txn_count` | `ticket_txn_count` | `CASE > 0` | Dữ liệu sạch |
-| **KPI-08** | Combo Attach Rate | `combo_attach_rate` | Ngày × Rạp × Giờ | `combo_txn_count` | `ticket_txn_count` | `CASE > 0` | Dữ liệu sạch |
-| **KPI-09** | F&B Spend / Txn | `spp_clean` | Ngày × Rạp × Giờ | `fnb_revenue_clean` | `ticket_txn_count` | `CASE > 0` | Dữ liệu sạch |
-| **KPI-10** | Anomaly Rate | `anom_txn_rate_pct` | Suất chiếu | `anom_txns` | `total_txns` | `NULLIF` | Phân tích lỗi |
+| Mã KPI | Tên chỉ số | Tên cột SQL | Grain | Tử số | Mẫu số | Bảo vệ mẫu số = 0 | Nhóm phân loại Raw vs Clean |
+|:---|:---|:---|:---|:---|:---|:---:|:---|
+| **KPI-01** | Ticket Transactions | `ticket_txn_count` | Ngày × Rạp × Giờ | `COUNT(DISTINCT txn_id)` | N/A | Không | **Nhóm 2: Toàn bộ giao dịch (Raw)** |
+| **KPI-02** | Tickets Sold | `ticket_qty_clean` | Ngày × Rạp / Suất | `SUM(qty)` | N/A | Không | **Nhóm 1: Dữ liệu sạch (`is_anomaly = 0`)** |
+| **KPI-03** | Ticket Revenue | `ticket_revenue_clean` | Ngày × Rạp / Suất | `SUM(net_amount)` | N/A | Không | **Nhóm 1: Dữ liệu sạch (`is_anomaly = 0`)** |
+| **KPI-04** | Average Ticket Price | `atp_clean` | Ngày × Rạp | `ticket_revenue_clean` | `ticket_qty_clean` | `CASE > 0` | **Nhóm 1: Dữ liệu sạch** |
+| **KPI-05** | Showtime Occupancy | `occupancy_clean` | Suất chiếu | `SUM(qty_clean)` | `dr.capacity` | Cần `NULLIF` | **Nhóm 1: Sạch** (`occupancy_raw` là Nhóm 2) |
+| **KPI-06** | F&B Revenue | `fnb_revenue_clean` | Ngày × Rạp × Giờ | `SUM(line_amount)` | N/A | Không | **Nhóm 1: Dữ liệu sạch (`is_anomaly = 0`)** |
+| **KPI-07** | F&B Attach Rate | `attach_rate` | Ngày × Rạp × Giờ | `fnb_txn_count` (Raw) | `ticket_txn_count` (Raw) | `CASE > 0` | **Nhóm 2: Toàn bộ giao dịch (Raw)** |
+| **KPI-08** | Combo Attach Rate | `combo_attach_rate` | Ngày × Rạp × Giờ | `combo_txn_count` (Raw) | `ticket_txn_count` (Raw) | `CASE > 0` | **Nhóm 2: Toàn bộ giao dịch (Raw)** |
+| **KPI-09** | F&B Spend / Txn | `spp_clean` | Ngày × Rạp × Giờ | `fnb_revenue_clean` (Clean) | `ticket_txn_count` (Raw) | `CASE > 0` | **Nhóm 3: Kết hợp (Tử sạch / Mẫu thô)** |
+| **KPI-10** | Anomaly Rate | `anom_txn_rate_pct` | Suất chiếu | `anom_txns` | `total_txns` | `NULLIF` | Phân tích bất thường |
+
+---
+
+## 4. Backlog Đề xuất Cải tiến Nghiệp vụ Phiên bản Sau
+
+Theo đúng thỏa thuận nghiệm thu Data Contract của Task 5.1, hệ thống **không thay đổi code SQL hoặc sửa đổi công thức hiện hành**. Tuy nhiên, để hệ thống hoàn thiện hơn trong các giai đoạn phát triển tiếp theo, nhóm nghiên cứu ghi nhận các hạng mục sau vào Product Backlog:
+
+1. **Chuẩn hóa các chỉ số tỷ lệ F&B thuần Clean:**
+   - Tạo thêm cột `attach_rate_clean = fnb_txn_count_clean / ticket_txn_count_clean` trong đó cả hai thành phần đều lọc `is_anomaly = 0`.
+   - Tạo thêm cột `combo_attach_rate_clean = combo_txn_count_clean / ticket_txn_count_clean`.
+   - Tạo thêm cột `spp_pure_clean = fnb_revenue_clean / ticket_txn_count_clean`.
+2. **Bổ sung chỉ số Spend Per Patron (SPP) chuẩn quốc tế:**
+   - Tính toán `spp_per_seat = fnb_revenue_clean / ticket_qty_clean` (chia theo tổng số vé sạch bán ra thay vì số giao dịch vé), giúp ban quản lý đánh giá chính xác mức chi tiêu ẩm thực bình quân trên từng lượt khán giả vào rạp.
+3. **Phòng vệ mẫu số 0 cho Occupancy:**
+   - Nâng cấp công thức `(s.qty_clean::NUMERIC / dr.capacity)` thành `(s.qty_clean::NUMERIC / NULLIF(dr.capacity, 0))` trong `sql/03_views.sql` nhằm phòng vệ trường hợp phòng chiếu chưa cấu hình sức chứa.
