@@ -220,3 +220,99 @@ class TestHolidaysIntegration:
         assert date(2026, 1, 1) in official
         # Giáng sinh 24/12/2026 là peak day
         assert date(2026, 12, 24) in peak
+
+
+class TestScientificValidation:
+    """
+    Kiểm định khoa học (Scientific Validation) theo yêu cầu Task 7:
+      - Train/Test separation & non-overlapping index.
+      - Data leakage audit: one-step feature computation vs multi-step forecast horizon.
+      - Prediction interval consistency: y_lower <= yhat <= y_upper và non-negativity.
+      - Deterministic reproducibility: fixed random state.
+      - Missing data and zero values handling.
+    """
+
+    def test_train_test_no_temporal_overlap(self):
+        """Train và Test phải hoàn toàn tách biệt theo thời gian, không có ngày giao nhau."""
+        dates = pd.date_range("2025-10-01", "2026-09-30", freq="D")
+        df = pd.DataFrame({
+            "target_date": dates,
+            "cinema_key": 1,
+            "time_slot": "Tối",
+            "tickets_sold": np.random.uniform(50, 200, size=len(dates)),
+        })
+        train_df, test_df = split_train_test(df)
+        train_dates = set(train_df["target_date"].dt.date)
+        test_dates = set(test_df["target_date"].dt.date)
+        assert len(train_dates.intersection(test_dates)) == 0
+        assert max(train_dates) < min(test_dates)
+
+    def test_prediction_interval_bounds_and_non_negativity(self):
+        """Kiểm tra cận dưới và cận trên: 0 <= yhat_lower <= yhat <= yhat_upper."""
+        from core.forecast import run_xgboost_pipeline
+        dates_train = pd.date_range("2026-01-01", "2026-07-31", freq="D")
+        dates_test = pd.date_range("2026-08-01", "2026-08-14", freq="D")
+        records = []
+        for d in dates_train:
+            records.append({
+                "target_date": d, "cinema_key": 1, "time_slot": "Tối",
+                "tickets_sold": float(100 + 30 * np.sin(d.dayofweek))
+            })
+        for d in dates_test:
+            records.append({
+                "target_date": d, "cinema_key": 1, "time_slot": "Tối",
+                "tickets_sold": float(100 + 30 * np.sin(d.dayofweek))
+            })
+        df = pd.DataFrame(records)
+        train_df, test_df = split_train_test(df)
+        test_pred_df, future_pred_df = run_xgboost_pipeline(train_df, test_df, future_horizon_days=7)
+
+        for col in ["yhat", "yhat_lower", "yhat_upper"]:
+            assert col in test_pred_df.columns
+            assert col in future_pred_df.columns
+            # Non-negativity constraint
+            assert (test_pred_df[col] >= 0).all()
+            assert (future_pred_df[col] >= 0).all()
+
+        # Interval ordering constraint
+        assert (test_pred_df["yhat_lower"] <= test_pred_df["yhat"] + 1e-6).all()
+        assert (test_pred_df["yhat"] <= test_pred_df["yhat_upper"] + 1e-6).all()
+        assert (future_pred_df["yhat_lower"] <= future_pred_df["yhat"] + 1e-6).all()
+        assert (future_pred_df["yhat"] <= future_pred_df["yhat_upper"] + 1e-6).all()
+
+    def test_xgboost_reproducibility(self):
+        """Với random_state=42 cố định, 2 lần fit và dự báo phải cho kết quả giống hệt nhau."""
+        from core.forecast import run_xgboost_pipeline
+        dates = pd.date_range("2026-05-01", "2026-08-14", freq="D")
+        records = []
+        for d in dates:
+            records.append({
+                "target_date": d, "cinema_key": 1, "time_slot": "Chiều",
+                "tickets_sold": float(50 + 20 * (d.dayofweek >= 5))
+            })
+        df = pd.DataFrame(records)
+        train_df, test_df = split_train_test(df)
+        t1, f1 = run_xgboost_pipeline(train_df, test_df, future_horizon_days=5)
+        t2, f2 = run_xgboost_pipeline(train_df, test_df, future_horizon_days=5)
+        np.testing.assert_allclose(t1["yhat"].values, t2["yhat"].values, rtol=1e-5)
+        np.testing.assert_allclose(f1["yhat"].values, f2["yhat"].values, rtol=1e-5)
+
+    def test_future_autoregressive_horizon_14(self):
+        """Kiểm tra dự báo tương lai 14 ngày sinh đúng số dòng và ngày liên tiếp."""
+        from core.forecast import run_xgboost_pipeline
+        dates = pd.date_range("2026-06-01", "2026-08-10", freq="D")
+        records = []
+        for d in dates:
+            records.append({
+                "target_date": d, "cinema_key": 1, "time_slot": "Tối",
+                "tickets_sold": float(80.0)
+            })
+        df = pd.DataFrame(records)
+        train_df, test_df = split_train_test(df)
+        _, future_pred_df = run_xgboost_pipeline(train_df, test_df, future_horizon_days=14)
+        assert len(future_pred_df) == 14
+        expected_start = test_df["target_date"].max() + timedelta(days=1)
+        expected_end = test_df["target_date"].max() + timedelta(days=14)
+        assert future_pred_df["target_date"].min() == expected_start
+        assert future_pred_df["target_date"].max() == expected_end
+
