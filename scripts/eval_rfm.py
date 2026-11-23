@@ -35,7 +35,12 @@ from core.rfm import (
 
 
 def calculate_purity(y_true: pd.Series, y_pred: pd.Series) -> float:
-    """Tính độ tinh khiết (Purity) của các cụm so với nhãn gốc."""
+    """
+    Tính độ tinh khiết (Clustering Purity) của các cụm so với nhãn gốc:
+        Purity(Omega, C) = (1 / N) * sum_{k} max_{j} |omega_k cap c_j|
+    Trong đó y_pred bắt buộc phải là `cluster_id` duy nhất do K-Means sinh ra,
+    tuyệt đối không dùng `cluster_name` để tránh hiện tượng sáp nhập các cụm trùng tên.
+    """
     contingency = pd.crosstab(y_pred, y_true)
     return float(np.sum(contingency.max(axis=1)) / len(y_true))
 
@@ -90,10 +95,10 @@ def evaluate_rfm():
     X_scaled = scaler.fit_transform(X_log)
 
     print("\n==================================================")
-    print("  ĐÁNH GIÁ CỤM K-MEANS VỚI k = 4, 5, 6")
+    print("  ĐÁNH GIÁ CỤM K-MEANS VỚI k = 3, 4, 5, 6")
     print("==================================================")
 
-    for k in [4, 5, 6]:
+    for k in [3, 4, 5, 6]:
         km = KMeans(n_clusters=k, random_state=42, n_init=10)
         cluster_ids = km.fit_predict(X_scaled)
 
@@ -106,9 +111,10 @@ def evaluate_rfm():
         df_eval["cluster_name"] = df_eval["cluster_id"].map(label_map)
 
         ari = adjusted_rand_score(df_eval["latent_segment"], df_eval["cluster_id"])
-        purity = calculate_purity(df_eval["latent_segment"], df_eval["cluster_name"])
+        # Sửa: Purity tính trên cluster_id duy nhất do K-Means sinh ra, không tính trên cluster_name
+        purity = calculate_purity(df_eval["latent_segment"], df_eval["cluster_id"])
 
-        print(f"\n>>> [k = {k}] ARI = {ari:.4f} | Purity = {purity:.4f}")
+        print(f"\n>>> [k = {k}] ARI = {ari:.4f} | Overall Purity (theo cluster_id) = {purity:.4f}")
         print("Tâm cụm đặc trưng (Centroids):")
         cent_display = centroids.copy()
         cent_display["name"] = cent_display.index.map(label_map)
@@ -116,10 +122,56 @@ def evaluate_rfm():
         cent_display["count"] = df_eval.groupby("cluster_id")["customer_id"].count()
         print(cent_display[["name", "count", "recency_days", "frequency", "tenure", "monetary"]].to_string())
 
-        print(f"\nBảng nhầm lẫn (Crosstab: Hàng=Latent Segment, Cột=KMeans Cluster Name) [k={k}]:")
+        print(f"\nBảng nhầm lẫn (Crosstab: Hàng=Latent Segment, Cột=KMeans Cluster Name [cluster_id]) [k={k}]:")
         ct = pd.crosstab(df_eval["latent_segment"], df_eval["cluster_name"], margins=True)
         print(ct.to_string())
+
+        # Chuẩn hóa các chỉ số đánh giá cho phân khúc VIP
+        if "VIP" in df_eval["cluster_name"].values and "VIP" in df_eval["latent_segment"].values:
+            vip_cids = [cid for cid, name in label_map.items() if name == "VIP"]
+            vip_latent = (df_eval["latent_segment"] == "VIP")
+            vip_cluster = df_eval["cluster_id"].isin(vip_cids)
+            intersection = int((vip_latent & vip_cluster).sum())
+            total_latent_vip = int(vip_latent.sum())
+            total_cluster_vip = int(vip_cluster.sum())
+
+            recall_vip = intersection / total_latent_vip if total_latent_vip else 0.0
+            purity_vip = intersection / total_cluster_vip if total_cluster_vip else 0.0
+
+            print(f"\n  [Chuẩn hóa chỉ số phân khúc VIP]:")
+            print(f"  - Recall lớp VIP tiềm ẩn (Latent Class Recall): {intersection}/{total_latent_vip} = {recall_vip:.4f} ({recall_vip*100:.2f}%)")
+            print(f"  - Purity của cụm VIP (Cluster Purity / Precision): {intersection}/{total_cluster_vip} = {purity_vip:.4f} ({purity_vip*100:.2f}%)")
+
         print("-" * 60)
+
+    # 3. Đánh giá độ ổn định phân hoạch (Stability & Reproducibility)
+    print("\n==================================================")
+    print("  ĐÁNH GIÁ ĐỘ ỔN ĐỊNH PHÂN HOẠCH (STABILITY & REPRODUCIBILITY)")
+    print("==================================================")
+    seeds = [42, 10, 100, 2024, 999]
+    print(f"Danh sách random seeds kiểm tra: {seeds}")
+    for k in [3, 4, 5, 6]:
+        runs = {}
+        for s in seeds:
+            km = KMeans(n_clusters=k, random_state=s, n_init=10)
+            runs[s] = km.fit_predict(X_scaled)
+
+        # Reproducibility check: cùng cấu hình, cùng seed cho cùng kết quả (ARI = 1.0)
+        km_rep = KMeans(n_clusters=k, random_state=42, n_init=10)
+        rep_labels = km_rep.fit_predict(X_scaled)
+        rep_ari = adjusted_rand_score(runs[42], rep_labels)
+
+        # Stability check: Pairwise ARI giữa các seed khác nhau
+        pairwise_aris = []
+        for i in range(len(seeds)):
+            for j in range(i + 1, len(seeds)):
+                pairwise_aris.append(adjusted_rand_score(runs[seeds[i]], runs[seeds[j]]))
+
+        print(
+            f"k = {k}: Reproducibility (ARI cùng seed) = {rep_ari:.4f} | "
+            f"Stability (Mean Pairwise ARI) = {np.mean(pairwise_aris):.4f} "
+            f"(min={np.min(pairwise_aris):.4f}, max={np.max(pairwise_aris):.4f}, std={np.std(pairwise_aris):.4f})"
+        )
 
     logger.info("=== HOÀN TẤT ĐÁNH GIÁ MÔ HÌNH RFM ===")
 

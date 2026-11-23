@@ -17,6 +17,7 @@ from core.rfm import (
     cluster_rfm_customers,
     build_cluster_profiles,
 )
+from scripts.eval_rfm import calculate_purity
 
 
 @pytest.fixture
@@ -467,4 +468,27 @@ def test_insufficient_data_raises_value_error():
     ])
     with pytest.raises(ValueError, match="nhỏ hơn k tối đa"):
         evaluate_kmeans_candidates(small_df, k_range=range(3, 7))
+
+
+def test_purity_calculation_with_duplicate_cluster_names():
+    """
+    Kiểm định phương pháp (Task 6.1): Purity phải tính trên cluster_id duy nhất, không dùng cluster_name.
+    Khi hai cluster_id khác nhau (ví dụ: cụm 0 và cụm 1) có cùng cluster_name (ví dụ: 'Thỉnh thoảng'),
+    tính Purity trên cluster_name sẽ làm sáp nhập cụm và bóp méo/sai lệch độ tinh khiết thực sự.
+    """
+    y_true = pd.Series(["ClassA", "ClassA", "ClassB", "ClassB"])
+    cluster_id = pd.Series([0, 0, 1, 1])
+    # Giả sử cả hai cụm đều được gán cùng nhãn 'Thỉnh thoảng'
+    cluster_name = pd.Series(["Thỉnh thoảng", "Thỉnh thoảng", "Thỉnh thoảng", "Thỉnh thoảng"])
+
+    # 1. Purity chuẩn khoa học trên cluster_id:
+    # Cụm 0 thuần khiết 100% ClassA (2/2), Cụm 1 thuần khiết 100% ClassB (2/2) -> Purity = (2 + 2) / 4 = 1.0
+    purity_correct = calculate_purity(y_true, cluster_id)
+    assert purity_correct == 1.0, f"Purity trên cluster_id phải là 1.0, thực tế: {purity_correct}"
+
+    # 2. Nếu tính sai trên cluster_name:
+    # Cả 4 mẫu bị gộp chung vào 1 nhóm duy nhất có 2 ClassA và 2 ClassB -> max(2, 2) / 4 = 0.5
+    purity_flawed = calculate_purity(y_true, cluster_name)
+    assert purity_flawed == 0.5, f"Purity trên cluster_name bị suy thoái thành 0.5, thực tế: {purity_flawed}"
+
 
