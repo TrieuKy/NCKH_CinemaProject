@@ -11,6 +11,7 @@ from etl.db import get_engine
 from reviews.ingest import (
     create_import_log,
     get_cinema_key,
+    ingest,
     parse_date,
     parse_rating,
     save_raw_reviews,
@@ -205,4 +206,44 @@ def test_ingest_content_update_resets_is_processed(db_context):
         assert float(row[0]) == 1.0
         assert row[1] == "Sửa lại: dịch vụ tệ quá"
         assert row[2] is False
+
+
+def test_ingest_idempotency_full_flow(db_context):
+    engine, ckey, prefix = db_context
+    rows = [
+        {
+            "review_id": f"{prefix}idem_1",
+            "rating": 5.0,
+            "review_text": "Rạp sạch đẹp",
+            "published_at": "2026-10-12",
+        },
+        {
+            "review_id": f"{prefix}idem_2",
+            "rating": 2.0,
+            "review_text": "Xếp hàng lâu",
+            "published_at": "2026-10-13",
+        },
+    ]
+
+    rep1 = ingest(engine, rows, cinema_key=ckey, source=SOURCE_MANUAL, raw_file_path=f"{prefix}idem")
+    assert rep1["rows_new"] == 2
+    assert rep1["rows_dup"] == 0
+    assert rep1["rows_skipped"] == 0
+
+    # Chạy lại cùng dữ liệu -> idempotent: 0 mới, 2 trùng
+    rep2 = ingest(engine, rows, cinema_key=ckey, source=SOURCE_MANUAL, raw_file_path=f"{prefix}idem")
+    assert rep2["rows_new"] == 0
+    assert rep2["rows_dup"] == 2
+    assert rep2["rows_skipped"] == 0
+
+    # Dọn dữ liệu test theo đúng thứ tự FK (review_raw trước rồi mới đến review_import_log)
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM cinema_dw.review_raw WHERE review_id LIKE :prefix"),
+            {"prefix": f"{prefix}%"},
+        )
+        conn.execute(
+            text("DELETE FROM cinema_dw.review_import_log WHERE raw_file_path LIKE :prefix"),
+            {"prefix": f"%{prefix}%"},
+        )
 

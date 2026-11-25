@@ -129,3 +129,40 @@ def test_insights_comparison_with_prev_period():
     assert vesinh_ins["prev_pct_negative"] == 20.0
     assert vesinh_ins["pct_negative"] == 50.0
     assert vesinh_ins["delta_pct_negative"] == 30.0
+
+
+def test_insights_insufficient_prev_period_ignored():
+    # prev_df có < min_sample -> không tính prev_pct_negative và delta_pct_negative
+    prev_df = _create_sample_df(n_rows=5, neg_topic="Vệ sinh", neg_count=1)
+    curr_df = _create_sample_df(n_rows=12, neg_topic="Vệ sinh", neg_count=7)
+    insights = generate_operational_insights(curr_df, prev_df=prev_df, min_sample=10)
+    vesinh_ins = next(x for x in insights if x["topic"] == "Vệ sinh")
+    assert vesinh_ins["prev_pct_negative"] is None
+    assert vesinh_ins["delta_pct_negative"] is None
+    assert vesinh_ins["priority"] == "ƯU TIÊN CAO"
+
+
+def test_insights_multi_topic_review_attribution():
+    # Review đa chủ đề được gán cùng 1 sentiment_final cho mọi chủ đề xuất hiện (documenting non-ABSA)
+    rows = [
+        {
+            "review_id": f"m_{i}",
+            "topics": ["Phòng chiếu & Âm thanh", "Thái độ phục vụ"],
+            "sentiment_final": "NEGATIVE" if i < 6 else "POSITIVE",
+            "rating": 1.0 if i < 6 else 5.0,
+        }
+        for i in range(10)
+    ]
+    df = pd.DataFrame(rows)
+    breakdown = analyze_topic_breakdown(df)
+    sound_row = breakdown[breakdown["topic"] == "Phòng chiếu & Âm thanh"].iloc[0]
+    staff_row = breakdown[breakdown["topic"] == "Thái độ phục vụ"].iloc[0]
+    assert sound_row["negative_count"] == 6
+    assert staff_row["negative_count"] == 6
+
+
+def test_insights_sorted_by_severity_score():
+    df = _create_sample_df(n_rows=15, neg_topic="Vệ sinh", neg_count=6)
+    insights = generate_operational_insights(df, min_sample=10)
+    scores = [x["severity_score"] for x in insights]
+    assert scores == sorted(scores, reverse=True)

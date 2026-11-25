@@ -185,3 +185,74 @@ def test_process_batch():
     assert len(batch_res) == 2
     assert batch_res[0]["sentiment_final"] == "POSITIVE"
     assert batch_res[1]["sentiment_final"] == "NEGATIVE"
+
+
+# ===========================================================================
+# 7. Scientific validation & regression tests (Task 8)
+# ===========================================================================
+
+def test_sentiment_text_vietnamese_negation():
+    assert sentiment_from_text("Cố úp sale không hài lòng") == "NEGATIVE"
+    assert sentiment_from_text("Thái độ nhân viên ko tốt") == "NEGATIVE"
+    assert sentiment_from_text("Phòng chiếu chẳng đẹp chút nào") == "NEGATIVE"
+    assert sentiment_from_text("Phim cũng không tệ lắm") == "POSITIVE"
+
+
+def test_sentiment_text_word_boundary_no_false_substring():
+    # "ok" không được khớp nhầm trong "booking" hay "tiktok"
+    from reviews.nlp import _count_lexicon_polarity
+    assert _count_lexicon_polarity("đặt vé qua booking trên tiktok") == (0, 0)
+
+
+def test_sentiment_text_difficult_vietnamese_and_reproducibility():
+    # Tái lập: gọi nhiều lần cùng input phải cho cùng kết quả
+    cases = [
+        "Không gian ok, không quá đông nên rất thoải mái 😍",
+        "Hôm nay đi xem phim, đặt vé 10h30",
+        "Âm thanh tuyệt vời nhưng nhân viên thái độ cọc cằn",
+    ]
+    for txt in cases:
+        r1 = process_review("rep_1", 3.0, txt)
+        r2 = process_review("rep_1", 3.0, txt)
+        assert r1 == r2
+
+
+def test_sentiment_mixed_and_sarcasm_rating_mismatch():
+    # Rating thấp (1 sao) nhưng văn bản chứa từ tích cực (mỉa mai / khen đểu)
+    sent_r = sentiment_from_rating(1.0)
+    sent_t = sentiment_from_text("Rạp tuyệt vời quá, chờ 45 phút mới được vào")
+    final_label, score = merge_sentiment_final(sent_r, sent_t, 1.0)
+    assert final_label == "NEGATIVE"
+    assert score <= -0.2
+
+
+def test_extract_topics_multi_topic():
+    text = "Giá vé đắt, nhà vệ sinh dơ bẩn, màn hình mờ và nhân viên cọc cằn."
+    topics = extract_topics(text)
+    assert "Giá cả & Vé" in topics
+    assert "Vệ sinh" in topics
+    assert "Phòng chiếu & Âm thanh" in topics
+    assert "Thái độ phục vụ" in topics
+    assert len(topics) == 4
+
+
+def test_evaluation_metrics_computation():
+    from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_recall_fscore_support
+
+    y_true = ["POSITIVE", "POSITIVE", "NEGATIVE", "NEGATIVE", "NEUTRAL", "POSITIVE"]
+    y_pred = ["POSITIVE", "NEGATIVE", "NEGATIVE", "NEGATIVE", "NEUTRAL", "POSITIVE"]
+    labels = ["NEGATIVE", "NEUTRAL", "POSITIVE"]
+
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    assert cm.shape == (3, 3)
+    assert cm.sum() == len(y_true)
+
+    acc = accuracy_score(y_true, y_pred)
+    macro_f1 = f1_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)
+    weighted_f1 = f1_score(y_true, y_pred, labels=labels, average="weighted", zero_division=0)
+    prec, rec, _, _ = precision_recall_fscore_support(y_true, y_pred, labels=labels, zero_division=0)
+
+    assert 0.0 <= acc <= 1.0
+    assert 0.0 <= macro_f1 <= 1.0
+    assert 0.0 <= weighted_f1 <= 1.0
+    assert len(prec) == 3 and len(rec) == 3

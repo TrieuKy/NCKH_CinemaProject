@@ -94,6 +94,10 @@ _VIET_PATTERN = re.compile(
     r"ÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚÝĂĐƠƯẠẢẤẦẨẪẬẮẰẲẴẶẸẺẼẾỀỂỄỆỈỊỌỎỐỒỔỖỘỚỜỞỠỢỤỦỨỪỬỮỰỲỶỸỴ]"
 )
 
+# Từ phủ định tiếng Việt thường gặp (bao gồm viết tắt phổ biến)
+_NEGATION_PREFIX = r"(?:không|ko|k|chẳng|chả|chưa|hok)\s+(?:quá\s+|rất\s+|hơi\s+)?"
+_NEGATION_RE = re.compile(r"\b" + _NEGATION_PREFIX + r"$")
+
 
 # ===========================================================================
 # 1. Tiện ích văn bản
@@ -147,19 +151,42 @@ def sentiment_from_rating(rating: Optional[Any]) -> Optional[str]:
     return "NEUTRAL"
 
 
+def _count_lexicon_polarity(cleaned: str) -> Tuple[int, int]:
+    """
+    Đếm số từ/cụm từ tích cực và tiêu cực với ranh giới từ (word boundary)
+    và xử lý phủ định tiếng Việt đứng liền trước (ví dụ: 'không hài lòng', 'ko tốt').
+    """
+    pos = 0
+    neg = 0
+    for w in _POSITIVE_WORDS:
+        for m in re.finditer(r"(?<!\w)" + re.escape(w) + r"(?!\w)", cleaned):
+            prefix = cleaned[max(0, m.start() - 24):m.start()]
+            if _NEGATION_RE.search(prefix):
+                neg += 1
+            else:
+                pos += 1
+    for w in _NEGATIVE_WORDS:
+        for m in re.finditer(r"(?<!\w)" + re.escape(w) + r"(?!\w)", cleaned):
+            prefix = cleaned[max(0, m.start() - 24):m.start()]
+            if _NEGATION_RE.search(prefix):
+                pos += 1
+            else:
+                neg += 1
+    return pos, neg
+
+
 def sentiment_from_text(text: Optional[str]) -> Optional[str]:
     """
     Chiều 2: cảm xúc từ văn bản.
-    Dùng lexicon tiếng Việt; kết hợp underthesea nếu có.
+    Dùng lexicon tiếng Việt (có xử lý phủ định); kết hợp underthesea nếu có.
     Trả None nếu không có văn bản.
     """
     cleaned = clean_text(text or "")
     if not cleaned:
         return None
 
-    # Đếm từ tích cực / tiêu cực
-    pos = sum(1 for w in _POSITIVE_WORDS if w in cleaned)
-    neg = sum(1 for w in _NEGATIVE_WORDS if w in cleaned)
+    # Đếm từ tích cực / tiêu cực (có xử lý phủ định & word boundary)
+    pos, neg = _count_lexicon_polarity(cleaned)
 
     # Kết hợp underthesea nếu có
     uts_label: Optional[str] = None

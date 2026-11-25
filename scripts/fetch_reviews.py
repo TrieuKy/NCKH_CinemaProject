@@ -37,7 +37,7 @@ from reviews.crawler import (
     fetch_reviews_apify,
     get_cinema_crawl_config,
 )
-from reviews.ingest import ingest
+from reviews.ingest import SOURCE_APIFY, ingest
 
 logger = logging.getLogger("reviews.fetch")
 
@@ -196,7 +196,7 @@ def main():
         engine=engine,
         rows=reviews,
         cinema_key=cinema_config["cinema_key"],
-        source="APIFY",
+        source=SOURCE_APIFY,
         actor_name=ACTOR_ID,
         apify_run_id=fetch_result.get("apify_run_id"),
         dataset_id=fetch_result.get("dataset_id"),
