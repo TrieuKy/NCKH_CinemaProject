@@ -83,12 +83,69 @@ def calculate_mape(y_true: np.ndarray | pd.Series, y_pred: np.ndarray | pd.Serie
     return float(np.mean(np.abs((y_t[nonzero_mask] - y_p[nonzero_mask]) / y_t[nonzero_mask])))
 
 
+def calculate_mae(y_true: np.ndarray | pd.Series, y_pred: np.ndarray | pd.Series) -> float:
+    """
+    Mean Absolute Error (MAE):
+        MAE = mean(|y_true - y_pred|)
+    """
+    y_t = np.asarray(y_true, dtype=float)
+    y_p = np.asarray(y_pred, dtype=float)
+    if len(y_t) == 0:
+        return 0.0
+    return float(np.mean(np.abs(y_t - y_p)))
+
+
+def calculate_bias(y_true: np.ndarray | pd.Series, y_pred: np.ndarray | pd.Series) -> float:
+    """
+    Mean Forecast Bias:
+        Bias = mean(y_pred - y_true)
+    Giá trị dương nghĩa là mô hình dự báo cao hơn thực tế (over-forecast),
+    giá trị âm nghĩa là dự báo thấp hơn thực tế (under-forecast).
+    """
+    y_t = np.asarray(y_true, dtype=float)
+    y_p = np.asarray(y_pred, dtype=float)
+    if len(y_t) == 0:
+        return 0.0
+    return float(np.mean(y_p - y_t))
+
+
+def compute_interval_coverage(
+    y_true: np.ndarray | pd.Series,
+    y_lower: np.ndarray | pd.Series,
+    y_upper: np.ndarray | pd.Series,
+) -> float:
+    """
+    Tỷ lệ bao phủ thực nghiệm (Empirical Coverage) của khoảng dự báo:
+        Coverage = mean(y_lower <= y_true <= y_upper)
+    """
+    y_t = np.asarray(y_true, dtype=float)
+    lo = np.asarray(y_lower, dtype=float)
+    hi = np.asarray(y_upper, dtype=float)
+    if len(y_t) == 0:
+        return 0.0
+    return float(np.mean((y_t >= lo) & (y_t <= hi)))
+
+
+def compute_mean_interval_width(
+    y_lower: np.ndarray | pd.Series,
+    y_upper: np.ndarray | pd.Series,
+) -> float:
+    """Độ rộng trung bình của khoảng dự báo (Mean Interval Width): mean(y_upper - y_lower)."""
+    lo = np.asarray(y_lower, dtype=float)
+    hi = np.asarray(y_upper, dtype=float)
+    if len(lo) == 0:
+        return 0.0
+    return float(np.mean(hi - lo))
+
+
 def evaluate_forecast(y_true: np.ndarray | pd.Series, y_pred: np.ndarray | pd.Series) -> Dict[str, float]:
-    """Tính toàn bộ 3 chỉ số WAPE, RMSE, MAPE."""
+    """Tính toàn bộ các chỉ số WAPE, RMSE, MAPE, MAE, Bias."""
     return {
         "wape": calculate_wape(y_true, y_pred),
         "rmse": calculate_rmse(y_true, y_pred),
         "mape": calculate_mape(y_true, y_pred),
+        "mae": calculate_mae(y_true, y_pred),
+        "bias": calculate_bias(y_true, y_pred),
     }
 
 
@@ -149,6 +206,68 @@ def split_train_test(
     test_df = test_df.sort_values(["target_date", "cinema_key", "time_slot"]).reset_index(drop=True)
 
     return train_df, test_df
+
+
+def split_train_calibration(
+    train_df: pd.DataFrame,
+    cal_days: int = 31,
+    min_train_days: int = 30,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Tách tập Training thành (sub_train_df, cal_df) theo thời gian tăng dần
+    để hiệu chỉnh khoảng dự báo hoàn toàn độc lập với tập Evaluation/Test.
+
+    Quy tắc chia cho dữ liệu 12 tháng (Train ~10 tháng: 2025-10-01 .. 2026-07-31):
+      - Nếu số ngày duy nhất >= min_train_days + cal_days (mặc định >= 61 ngày):
+        lấy `cal_days` ngày cuối cùng của Train (ví dụ tháng 07/2026) làm tập Calibration,
+        phần trước đó làm Sub-Train.
+      - Nếu tập Train ngắn hơn (ví dụ dữ liệu kiểm thử 21..60 ngày):
+        lấy 20% số ngày cuối (tối thiểu 1 ngày) làm Calibration, giữ ít nhất 14 ngày cho Sub-Train.
+      - Nếu tập Train quá ngắn (<= 15 ngày): trả về (train_df, empty DataFrame) để fallback an toàn.
+    """
+    if len(train_df) == 0:
+        return train_df.copy(), train_df.iloc[0:0].copy()
+
+    unique_dates = sorted(train_df["target_date"].dt.normalize().unique())
+    n_days = len(unique_dates)
+
+    if n_days <= 15:
+        return train_df.copy(), train_df.iloc[0:0].copy()
+
+    if n_days >= min_train_days + cal_days:
+        n_cal = cal_days
+    else:
+        n_cal = max(1, min(n_days - 14, int(round(n_days * 0.2))))
+        if n_cal <= 0:
+            return train_df.copy(), train_df.iloc[0:0].copy()
+
+    cal_start_ts = pd.Timestamp(unique_dates[-n_cal])
+    sub_train_df = train_df[train_df["target_date"] < cal_start_ts].copy()
+    cal_df = train_df[train_df["target_date"] >= cal_start_ts].copy()
+
+    return (
+        sub_train_df.sort_values(["target_date", "cinema_key", "time_slot"]).reset_index(drop=True),
+        cal_df.sort_values(["target_date", "cinema_key", "time_slot"]).reset_index(drop=True),
+    )
+
+
+def _calibrate_baseline_residual_std(train_df: pd.DataFrame, cal_days: int = 31) -> float:
+    """
+    Hiệu chỉnh độ lệch chuẩn phần dư cho Baseline hoàn toàn trên tập Train/Calibration,
+    không sử dụng nhãn thực tế của tập Test/Evaluation.
+    """
+    sub_train_df, cal_df = split_train_calibration(train_df, cal_days=cal_days)
+    if len(cal_df) > 0 and len(sub_train_df) > 0:
+        cal_pred = predict_baseline(sub_train_df, cal_df)
+        res = cal_pred["tickets_sold"].values - cal_pred["yhat"].values
+        if len(res) > 1:
+            return float(np.std(res, ddof=1))
+        if len(res) == 1:
+            return float(np.abs(res[0]))
+    # Fallback nếu tập train quá ngắn: dùng phần dư trên chính train_df (vẫn không chạm test_df)
+    in_pred = predict_baseline(train_df, train_df)
+    res = in_pred["tickets_sold"].values - in_pred["yhat"].values
+    return float(np.std(res)) if len(res) > 0 else 15.0
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -335,92 +454,113 @@ def create_xgboost_features(df: pd.DataFrame) -> pd.DataFrame:
     return feat_df
 
 
-def run_xgboost_pipeline(
+def _calibrate_xgboost_residual_std(
     train_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    future_horizon_days: int = FUTURE_HORIZON_DAYS,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    feature_cols: List[str],
+    cal_days: int = 31,
+) -> Tuple[float, Dict[str, Any]]:
     """
-    Chạy pipeline XGBoost:
-      1. Tạo đặc trưng (lag_7, lag_14, rolling_mean_7, thứ, is_holiday, is_peak_day, rạp, time_slot).
-      2. Huấn luyện mô hình XGBRegressor.
-      3. Dự báo trên tập kiểm tra.
-      4. Dự báo cuốn chiếu (autoregressive) 14 ngày tương lai.
-      5. Ước lượng cận dưới (y_lower) và cận trên (y_upper) theo độ lệch chuẩn phần dư 95%.
+    Hiệu chỉnh độ lệch chuẩn phần dư (residual_std) cho XGBoost hoàn toàn trên tập
+    Sub-Train -> Calibration bên trong `train_df`, tuyệt đối không sử dụng nhãn tập Test.
+
+    Lưu ý thống kê:
+      - Khoảng `yhat ± 1.96 * residual_std` là heuristic prediction interval dựa trên giả định
+        phần dư phân phối chuẩn, đồng nhất phương sai (homoscedastic) và độc lập.
+      - Với dữ liệu vé xem phim có tính bất đối xứng và đột biến cuối tuần/ngày lễ,
+        coverage thực nghiệm trên Evaluation không mặc định đạt đúng 95%.
     """
     import xgboost as xgb
 
-    full_df = pd.concat([train_df, test_df], ignore_index=True)
-    featured_df = create_xgboost_features(full_df)
+    featured_train = create_xgboost_features(train_df)
+    sub_train_df, cal_df = split_train_calibration(train_df, cal_days=cal_days)
 
-    feature_cols = [
-        "lag_7", "lag_14", "rolling_mean_7",
-        "day_of_week", "is_holiday", "is_peak_day",
-        "cinema_key", "time_slot",
-    ]
+    if len(cal_df) > 0 and len(sub_train_df) > 0:
+        cal_start_ts = cal_df["target_date"].min()
+        sub_feat = featured_train[featured_train["target_date"] < cal_start_ts].copy()
+        cal_feat = featured_train[featured_train["target_date"] >= cal_start_ts].copy()
 
-    train_data = featured_df[featured_df["target_date"] <= pd.to_datetime(TRAIN_END_DATE)].copy()
-    test_data = featured_df[
-        (featured_df["target_date"] >= pd.to_datetime(TEST_START_DATE)) &
-        (featured_df["target_date"] <= pd.to_datetime(TEST_END_DATE))
-    ].copy()
+        if len(sub_feat) > 0 and len(cal_feat) > 0:
+            cal_model = xgb.XGBRegressor(
+                n_estimators=100,
+                max_depth=5,
+                learning_rate=0.08,
+                enable_categorical=True,
+                random_state=42,
+            )
+            cal_model.fit(sub_feat[feature_cols], sub_feat["tickets_sold"])
+            cal_yhat = np.clip(cal_model.predict(cal_feat[feature_cols]), 0, None)
+            cal_residuals = cal_feat["tickets_sold"].values - cal_yhat
+            residual_std = float(np.std(cal_residuals, ddof=1)) if len(cal_residuals) > 1 else float(np.abs(cal_residuals[0]))
+            info = {
+                "method": "temporal_holdout_calibration",
+                "cal_start": str(cal_start_ts.date()),
+                "cal_end": str(cal_df["target_date"].max().date()),
+                "n_cal": int(len(cal_feat)),
+                "residual_std": residual_std,
+            }
+            return residual_std, info
 
-    model = xgb.XGBRegressor(
+    # Fallback an toàn cho tập dữ liệu tổng hợp rất ngắn (vẫn không dùng test_df)
+    fallback_model = xgb.XGBRegressor(
         n_estimators=100,
         max_depth=5,
         learning_rate=0.08,
         enable_categorical=True,
         random_state=42,
     )
-    model.fit(train_data[feature_cols], train_data["tickets_sold"])
+    fallback_model.fit(featured_train[feature_cols], featured_train["tickets_sold"])
+    in_yhat = np.clip(fallback_model.predict(featured_train[feature_cols]), 0, None)
+    in_res = featured_train["tickets_sold"].values - in_yhat
+    residual_std = float(np.std(in_res)) if len(in_res) > 0 else 10.0
+    info = {
+        "method": "train_insample_fallback",
+        "n_cal": int(len(featured_train)),
+        "residual_std": residual_std,
+    }
+    return residual_std, info
 
-    # 1. Dự báo tập test
-    test_preds = model.predict(test_data[feature_cols])
-    test_pred_df = test_data.copy()
-    test_pred_df["yhat"] = np.clip(test_preds, 0, None)
 
-    # Ước lượng residual standard deviation để tạo khoảng tin cậy 95%
-    residuals = test_pred_df["tickets_sold"].values - test_pred_df["yhat"].values
-    residual_std = float(np.std(residuals)) if len(residuals) > 0 else 10.0
-    z_score = 1.96
-
-    test_pred_df["yhat_lower"] = np.maximum(0.0, test_pred_df["yhat"] - z_score * residual_std)
-    test_pred_df["yhat_upper"] = test_pred_df["yhat"] + z_score * residual_std
-
-    # 2. Dự báo 14 ngày tương lai (cuốn chiếu ngày x rạp x time_slot)
-    last_data_date = test_df["target_date"].max()
-    min_year = train_df["target_date"].dt.year.min()
-    max_year = last_data_date.year + 1
+def _rollout_xgboost_horizon(
+    model: Any,
+    history_df: pd.DataFrame,
+    origin_date: pd.Timestamp,
+    horizon_days: int,
+    feature_cols: List[str],
+    cinema_categories: Any,
+    slot_categories: Any,
+    residual_std: float,
+    z_score: float = 1.96,
+) -> pd.DataFrame:
+    """
+    Dự báo cuốn chiếu (autoregressive) `horizon_days` ngày từ `origin_date + 1`.
+    Chỉ sử dụng quan sát <= `origin_date` và các giá trị `yhat` đã dự báo ở bước trước.
+    """
+    hist_cut = history_df[history_df["target_date"] <= origin_date].copy()
+    min_year = int(hist_cut["target_date"].dt.year.min())
+    max_year = int((origin_date + timedelta(days=horizon_days)).year) + 1
     official_holidays, peak_days = get_holiday_sets(min_year, max_year)
 
-    # Lịch sử vé theo (cinema_key, time_slot, date) để cập nhật động
     history: Dict[Tuple[int, str, date], float] = {}
-    for _, r in full_df.iterrows():
+    for _, r in hist_cut.iterrows():
         d = r["target_date"].date() if hasattr(r["target_date"], "date") else r["target_date"]
         history[(r["cinema_key"], r["time_slot"], d)] = float(r["tickets_sold"])
 
-    # Danh sách các tổ hợp (cinema_key, time_slot)
-    cinema_slots = train_df[["cinema_key", "time_slot"]].drop_duplicates().values.tolist()
-
+    cinema_slots = hist_cut[["cinema_key", "time_slot"]].drop_duplicates().values.tolist()
     future_rows = []
-    cinema_categories = train_data["cinema_key"].cat.categories
-    slot_categories = train_data["time_slot"].cat.categories
 
-    for step in range(1, future_horizon_days + 1):
-        cur_date = (last_data_date + timedelta(days=step)).date()
+    for step in range(1, horizon_days + 1):
+        cur_date = (origin_date + timedelta(days=step)).date()
         cur_dt = pd.to_datetime(cur_date)
         dow = cur_dt.dayofweek
         is_hol = 1 if cur_date in official_holidays else 0
         is_pk = 1 if cur_date in peak_days else 0
 
         for ck, slot in cinema_slots:
-            # Tính lag_7 và lag_14
             d_lag7 = cur_date - timedelta(days=7)
             d_lag14 = cur_date - timedelta(days=14)
             lag7_val = history.get((ck, slot, d_lag7), np.nan)
             lag14_val = history.get((ck, slot, d_lag14), np.nan)
 
-            # Tính rolling_mean_7 trên 7 ngày trước đó
             past_vals = [history.get((ck, slot, cur_date - timedelta(days=k))) for k in range(1, 8)]
             past_vals_clean = [v for v in past_vals if v is not None and not np.isnan(v)]
             roll7_val = float(np.mean(past_vals_clean)) if past_vals_clean else lag7_val
@@ -440,7 +580,6 @@ def run_xgboost_pipeline(
             single_df["time_slot"] = pd.Categorical(single_df["time_slot"], categories=slot_categories)
 
             pred_val = float(np.clip(model.predict(single_df[feature_cols])[0], 0, None))
-            # Cập nhật vào lịch sử để các bước tiếp theo dùng lại làm lag
             history[(ck, slot, cur_date)] = pred_val
 
             future_rows.append({
@@ -452,8 +591,236 @@ def run_xgboost_pipeline(
                 "yhat_upper": pred_val + z_score * residual_std,
             })
 
-    future_pred_df = pd.DataFrame(future_rows)
+    return pd.DataFrame(future_rows)
+
+
+def run_xgboost_pipeline(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    future_horizon_days: int = FUTURE_HORIZON_DAYS,
+    cal_days: int = 31,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Chạy pipeline XGBoost:
+      1. Hiệu chỉnh độ lệch chuẩn phần dư trên tập Calibration nội bộ (trong train_df),
+         tuyệt đối không dùng nhãn thực tế của test_df để tạo khoảng dự báo.
+      2. Huấn luyện mô hình XGBRegressor trên toàn bộ train_df.
+      3. Dự báo trên tập kiểm tra (chế độ rolling one-step với lag quan sát).
+      4. Dự báo cuốn chiếu (autoregressive) `future_horizon_days` ngày tương lai.
+      5. Ước lượng cận dưới (y_lower) và cận trên (y_upper) bằng `yhat ± 1.96 * residual_std_cal`.
+    """
+    import xgboost as xgb
+
+    feature_cols = [
+        "lag_7", "lag_14", "rolling_mean_7",
+        "day_of_week", "is_holiday", "is_peak_day",
+        "cinema_key", "time_slot",
+    ]
+
+    # 1. Hiệu chỉnh khoảng dự báo hoàn toàn độc lập với test_df
+    residual_std, _ = _calibrate_xgboost_residual_std(train_df, feature_cols, cal_days=cal_days)
+    z_score = 1.96
+
+    # 2. Tạo đặc trưng và huấn luyện trên toàn bộ train_df
+    full_df = pd.concat([train_df, test_df], ignore_index=True)
+    featured_df = create_xgboost_features(full_df)
+
+    train_end_ts = train_df["target_date"].max()
+    test_start_ts = test_df["target_date"].min()
+    test_end_ts = test_df["target_date"].max()
+
+    train_data = featured_df[featured_df["target_date"] <= train_end_ts].copy()
+    test_data = featured_df[
+        (featured_df["target_date"] >= test_start_ts) &
+        (featured_df["target_date"] <= test_end_ts)
+    ].copy()
+
+    model = xgb.XGBRegressor(
+        n_estimators=100,
+        max_depth=5,
+        learning_rate=0.08,
+        enable_categorical=True,
+        random_state=42,
+    )
+    model.fit(train_data[feature_cols], train_data["tickets_sold"])
+
+    # 3. Dự báo tập test (one-step rolling với quan sát quá khứ)
+    test_preds = model.predict(test_data[feature_cols])
+    test_pred_df = test_data.copy()
+    test_pred_df["yhat"] = np.clip(test_preds, 0, None)
+    test_pred_df["yhat_lower"] = np.maximum(0.0, test_pred_df["yhat"] - z_score * residual_std)
+    test_pred_df["yhat_upper"] = test_pred_df["yhat"] + z_score * residual_std
+
+    # 4. Dự báo future_horizon_days ngày tương lai (cuốn chiếu từ ngày cuối cùng của test_df)
+    last_data_date = test_df["target_date"].max()
+    future_pred_df = _rollout_xgboost_horizon(
+        model=model,
+        history_df=full_df,
+        origin_date=last_data_date,
+        horizon_days=future_horizon_days,
+        feature_cols=feature_cols,
+        cinema_categories=train_data["cinema_key"].cat.categories,
+        slot_categories=train_data["time_slot"].cat.categories,
+        residual_std=residual_std,
+        z_score=z_score,
+    )
+
     return test_pred_df, future_pred_df
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 6b. Dự báo Fixed-Origin Multi-Step (cho Rolling-Origin Backtesting)
+# ──────────────────────────────────────────────────────────────────────
+def predict_baseline_multistep(
+    history_df: pd.DataFrame,
+    origin_date: date | pd.Timestamp,
+    horizon_days: int = FUTURE_HORIZON_DAYS,
+    cal_days: int = 31,
+) -> pd.DataFrame:
+    """
+    Dự báo Lag-7 ở chế độ Fixed-Origin Multi-Step `horizon_days` ngày từ `origin_date + 1`:
+      - Chỉ sử dụng dữ liệu <= origin_date.
+      - Với h = 1..7: dùng quan sát thực tế tại (t - 7) <= origin_date (hoặc trung bình chuỗi nếu thiếu).
+      - Với h = 8..14: dùng giá trị dự báo yhat(t - 7) đã sinh trước đó (đệ quy).
+      - Khoảng dự báo hiệu chỉnh hoàn toàn trên lịch sử <= origin_date.
+    """
+    origin_ts = pd.to_datetime(origin_date)
+    hist = history_df[history_df["target_date"] <= origin_ts].copy()
+    if len(hist) == 0:
+        raise ValueError(f"Không có dữ liệu lịch sử <= {origin_date}")
+
+    residual_std = _calibrate_baseline_residual_std(hist, cal_days=cal_days)
+    z_score = 1.96
+
+    lookup: Dict[Tuple[int, str, date], float] = {}
+    for _, row in hist.iterrows():
+        d = row["target_date"].date() if hasattr(row["target_date"], "date") else row["target_date"]
+        lookup[(row["cinema_key"], row["time_slot"], d)] = float(row["tickets_sold"])
+
+    series_means = hist.groupby(["cinema_key", "time_slot"])["tickets_sold"].mean().to_dict()
+    cinema_slots = hist[["cinema_key", "time_slot"]].drop_duplicates().values.tolist()
+
+    rows = []
+    for step in range(1, horizon_days + 1):
+        cur_date = (origin_ts + timedelta(days=step)).date()
+        cur_dt = pd.to_datetime(cur_date)
+        prev_7 = cur_date - timedelta(days=7)
+        for ck, slot in cinema_slots:
+            val = lookup.get((ck, slot, prev_7))
+            if val is None:
+                val = series_means.get((ck, slot), 0.0)
+            pred_val = max(0.0, float(val))
+            lookup[(ck, slot, cur_date)] = pred_val
+            rows.append({
+                "target_date": cur_dt,
+                "cinema_key": ck,
+                "time_slot": slot,
+                "yhat": pred_val,
+                "yhat_lower": max(0.0, pred_val - z_score * residual_std),
+                "yhat_upper": pred_val + z_score * residual_std,
+            })
+
+    return pd.DataFrame(rows)
+
+
+def predict_prophet_multistep(
+    history_df: pd.DataFrame,
+    origin_date: date | pd.Timestamp,
+    horizon_days: int = FUTURE_HORIZON_DAYS,
+) -> pd.DataFrame:
+    """
+    Dự báo Prophet ở chế độ Fixed-Origin Multi-Step `horizon_days` ngày từ `origin_date + 1`:
+      - Chỉ fit trên dữ liệu <= origin_date cho từng chuỗi (cinema_key x time_slot).
+    """
+    from prophet import Prophet
+    import logging as _logging
+
+    _logging.getLogger("cmdstanpy").setLevel(_logging.WARNING)
+
+    origin_ts = pd.to_datetime(origin_date)
+    hist = history_df[history_df["target_date"] <= origin_ts].copy()
+    if len(hist) == 0:
+        raise ValueError(f"Không có dữ liệu lịch sử <= {origin_date}")
+
+    min_year = int(hist["target_date"].dt.year.min())
+    max_year = int((origin_ts + timedelta(days=horizon_days)).year) + 1
+    holidays_df = get_holidays_dataframe(min_year, max_year)
+    future_dates = pd.date_range(origin_ts + timedelta(days=1), periods=horizon_days, freq="D")
+
+    preds = []
+    for (c_key, slot), group in hist.groupby(["cinema_key", "time_slot"]):
+        prophet_train = pd.DataFrame({"ds": group["target_date"], "y": group["tickets_sold"]})
+        model = Prophet(
+            yearly_seasonality=False,
+            weekly_seasonality=True,
+            daily_seasonality=False,
+            holidays=holidays_df,
+        )
+        model.fit(prophet_train)
+        fc = model.predict(pd.DataFrame({"ds": future_dates}))
+        yhat = np.clip(fc["yhat"].values, 0, None)
+        yhat_lo = np.minimum(yhat, np.clip(fc["yhat_lower"].values, 0, None))
+        yhat_hi = np.maximum(yhat, np.clip(fc["yhat_upper"].values, 0, None))
+        preds.append(pd.DataFrame({
+            "target_date": future_dates,
+            "cinema_key": c_key,
+            "time_slot": slot,
+            "yhat": yhat,
+            "yhat_lower": yhat_lo,
+            "yhat_upper": yhat_hi,
+        }))
+
+    return pd.concat(preds, ignore_index=True)
+
+
+def predict_xgboost_multistep(
+    history_df: pd.DataFrame,
+    origin_date: date | pd.Timestamp,
+    horizon_days: int = FUTURE_HORIZON_DAYS,
+    cal_days: int = 31,
+) -> pd.DataFrame:
+    """
+    Dự báo XGBoost ở chế độ Fixed-Origin Multi-Step `horizon_days` ngày từ `origin_date + 1`:
+      - Cắt dữ liệu nghiêm ngặt <= origin_date (không chạm dữ liệu tương lai).
+      - Tạo đặc trưng, hiệu chỉnh khoảng dự báo và huấn luyện hoàn toàn trên dữ liệu <= origin_date.
+      - Rollout đệ quy 14 ngày dùng các giá trị dự báo đã sinh.
+    """
+    import xgboost as xgb
+
+    origin_ts = pd.to_datetime(origin_date)
+    hist = history_df[history_df["target_date"] <= origin_ts].copy()
+    if len(hist) == 0:
+        raise ValueError(f"Không có dữ liệu lịch sử <= {origin_date}")
+
+    feature_cols = [
+        "lag_7", "lag_14", "rolling_mean_7",
+        "day_of_week", "is_holiday", "is_peak_day",
+        "cinema_key", "time_slot",
+    ]
+
+    residual_std, _ = _calibrate_xgboost_residual_std(hist, feature_cols, cal_days=cal_days)
+    featured_hist = create_xgboost_features(hist)
+
+    model = xgb.XGBRegressor(
+        n_estimators=100,
+        max_depth=5,
+        learning_rate=0.08,
+        enable_categorical=True,
+        random_state=42,
+    )
+    model.fit(featured_hist[feature_cols], featured_hist["tickets_sold"])
+
+    return _rollout_xgboost_horizon(
+        model=model,
+        history_df=hist,
+        origin_date=origin_ts,
+        horizon_days=horizon_days,
+        feature_cols=feature_cols,
+        cinema_categories=featured_hist["cinema_key"].cat.categories,
+        slot_categories=featured_hist["time_slot"].cat.categories,
+        residual_std=residual_std,
+        z_score=1.96,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -600,9 +967,8 @@ def run_forecast(engine: Engine, cinema_key: Optional[int] = None) -> Dict[str, 
     m_baseline = evaluate_forecast(baseline_test["tickets_sold"], baseline_test["yhat"])
     logger.info("Baseline: WAPE=%.4f | RMSE=%.2f | MAPE=%.4f", m_baseline["wape"], m_baseline["rmse"], m_baseline["mape"])
 
-    # Tính khoảng tin cậy cho baseline trên tập test
-    b_res = baseline_test["tickets_sold"].values - baseline_test["yhat"].values
-    b_std = float(np.std(b_res)) if len(b_res) > 0 else 15.0
+    # Tính khoảng dự báo cho baseline hiệu chỉnh trên tập Train/Calibration (không dùng nhãn Test)
+    b_std = _calibrate_baseline_residual_std(train_df)
     baseline_test["yhat_lower"] = np.maximum(0.0, baseline_test["yhat"] - 1.96 * b_std)
     baseline_test["yhat_upper"] = baseline_test["yhat"] + 1.96 * b_std
 

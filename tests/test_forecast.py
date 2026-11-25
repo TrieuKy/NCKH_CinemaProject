@@ -316,3 +316,192 @@ class TestScientificValidation:
         assert future_pred_df["target_date"].min() == expected_start
         assert future_pred_df["target_date"].max() == expected_end
 
+
+class TestTask71Validation:
+    """
+    Kiểm thử bổ sung cho Task 7.1 (Section E):
+      1. Interval calibration không dùng nhãn Evaluation.
+      2. Thay đổi dữ liệu sau origin không làm thay đổi dự báo tại origin.
+      3. Recursive rollout đúng 14 ngày.
+      4. Missing showtime và missing lag.
+      5. Interval coverage, MIW, MAE, Bias computation.
+      6. Tái lập khi cố định cấu hình.
+      7. Backtest không làm thay đổi Fact/ETL hoặc bảng production.
+      8. Idempotency của logic persistence (save_forecast_to_db).
+    """
+
+    @staticmethod
+    def _make_synthetic_series(start="2026-05-01", end="2026-08-31", morning_weekend_only=False):
+        dates = pd.date_range(start, end, freq="D")
+        records = []
+        for d in dates:
+            records.append({
+                "target_date": d,
+                "cinema_key": 1,
+                "time_slot": "Tối",
+                "tickets_sold": float(150 + 40 * (d.dayofweek >= 5) + (d.day % 5)),
+            })
+            if not morning_weekend_only or d.dayofweek >= 5:
+                records.append({
+                    "target_date": d,
+                    "cinema_key": 1,
+                    "time_slot": "Sáng",
+                    "tickets_sold": float(60 + 15 * (d.dayofweek == 6)),
+                })
+        return pd.DataFrame(records)
+
+    def test_interval_calibration_ignores_evaluation_labels(self):
+        """Khoảng dự báo (half-width) không được phụ thuộc vào nhãn thực tế của tập Test."""
+        from core.forecast import run_xgboost_pipeline
+
+        df = self._make_synthetic_series("2026-04-01", "2026-08-14")
+        train_df, test_df = split_train_test(df, train_end=date(2026, 7, 31), test_start=date(2026, 8, 1), test_end=date(2026, 8, 14))
+
+        test_df_perturbed = test_df.copy()
+        test_df_perturbed["tickets_sold"] = test_df_perturbed["tickets_sold"] * 500.0 + 10000.0
+
+        t1, _ = run_xgboost_pipeline(train_df, test_df, future_horizon_days=7)
+        t2, _ = run_xgboost_pipeline(train_df, test_df_perturbed, future_horizon_days=7)
+
+        hw1 = (t1["yhat_upper"] - t1["yhat"]).values
+        hw2 = (t2["yhat_upper"] - t2["yhat"]).values
+        np.testing.assert_allclose(hw1, hw2, rtol=1e-6)
+
+    def test_future_perturbation_after_origin_does_not_change_forecast(self):
+        """Thay đổi dữ liệu thực tế sau origin không làm thay đổi dự báo tại origin."""
+        from core.forecast import predict_baseline_multistep, predict_xgboost_multistep
+
+        df = self._make_synthetic_series("2026-05-01", "2026-08-20")
+        origin = date(2026, 7, 31)
+
+        df_perturbed = df.copy()
+        mask = df_perturbed["target_date"] > pd.to_datetime(origin)
+        df_perturbed.loc[mask, "tickets_sold"] = 999999.0
+
+        for runner in (predict_baseline_multistep, predict_xgboost_multistep):
+            p1 = runner(df, origin, horizon_days=14)
+            p2 = runner(df_perturbed, origin, horizon_days=14)
+            np.testing.assert_allclose(p1["yhat"].values, p2["yhat"].values, rtol=1e-6)
+            np.testing.assert_allclose(p1["yhat_lower"].values, p2["yhat_lower"].values, rtol=1e-6)
+            np.testing.assert_allclose(p1["yhat_upper"].values, p2["yhat_upper"].values, rtol=1e-6)
+
+    def test_multistep_recursive_rollout_14_days(self):
+        """Kiểm tra rollout đệ quy đúng 14 ngày liên tiếp và bước 8..14 dùng yhat trước đó."""
+        from core.forecast import predict_baseline_multistep, predict_xgboost_multistep
+
+        df = self._make_synthetic_series("2026-05-01", "2026-08-20")
+        origin = date(2026, 7, 31)
+
+        for runner in (predict_baseline_multistep, predict_xgboost_multistep):
+            pred = runner(df, origin, horizon_days=14)
+            assert pred["target_date"].nunique() == 14
+            assert pred["target_date"].min() == pd.to_datetime(origin + timedelta(days=1))
+            assert pred["target_date"].max() == pd.to_datetime(origin + timedelta(days=14))
+            assert (pred["yhat"] >= 0).all()
+            assert (pred["yhat_lower"] <= pred["yhat"] + 1e-6).all()
+            assert (pred["yhat"] <= pred["yhat_upper"] + 1e-6).all()
+
+        # Kiểm tra riêng baseline bước 8..14 lặp lại đúng giá trị bước 1..7 (lag-7 đệ quy)
+        b_pred = predict_baseline_multistep(df, origin, horizon_days=14)
+        toi = b_pred[b_pred["time_slot"] == "Tối"].sort_values("target_date")
+        np.testing.assert_allclose(toi["yhat"].iloc[7:14].values, toi["yhat"].iloc[0:7].values, rtol=1e-6)
+
+    def test_missing_showtime_and_missing_lag_handling(self):
+        """Khung giờ Sáng chỉ có suất cuối tuần (thiếu suất ngày thường & thiếu lag) vẫn chạy an toàn."""
+        from core.forecast import predict_baseline_multistep, predict_xgboost_multistep
+
+        df = self._make_synthetic_series("2026-05-01", "2026-08-14", morning_weekend_only=True)
+        origin = date(2026, 7, 31)
+
+        for runner in (predict_baseline_multistep, predict_xgboost_multistep):
+            pred = runner(df, origin, horizon_days=14)
+            assert len(pred) == 14 * 2  # 2 time_slots
+            assert not pred["yhat"].isna().any()
+            assert (pred["yhat"] >= 0).all()
+            assert (pred["yhat_lower"] >= 0).all()
+            assert (pred["yhat_lower"] <= pred["yhat"] + 1e-6).all()
+            assert (pred["yhat"] <= pred["yhat_upper"] + 1e-6).all()
+
+    def test_interval_coverage_miw_mae_bias(self):
+        """Kiểm tra các hàm tính Coverage, Mean Interval Width, MAE và Bias."""
+        from core.forecast import (
+            calculate_bias,
+            calculate_mae,
+            compute_interval_coverage,
+            compute_mean_interval_width,
+        )
+
+        y_true = np.array([100.0, 200.0, 300.0, 400.0])
+        y_pred = np.array([110.0, 190.0, 310.0, 350.0])
+        y_lo = np.array([90.0, 180.0, 290.0, 360.0])   # điểm thứ 4 (400) nằm ngoài [360, 410]? No, 400 in [360, 410]!
+        y_hi = np.array([120.0, 210.0, 320.0, 390.0])  # điểm thứ 4 (400 > 390) nằm ngoài
+
+        assert compute_interval_coverage(y_true, y_lo, y_hi) == pytest.approx(0.75)
+        assert compute_mean_interval_width(y_lo, y_hi) == pytest.approx(30.0)
+        assert calculate_mae(y_true, y_pred) == pytest.approx((10 + 10 + 10 + 50) / 4.0)
+        assert calculate_bias(y_true, y_pred) == pytest.approx((10 - 10 + 10 - 50) / 4.0)
+        assert compute_interval_coverage([], [], []) == 0.0
+        assert compute_mean_interval_width([], []) == 0.0
+
+    def test_multistep_reproducibility_fixed_seed(self):
+        """Cố định cấu hình (random_state=42), 2 lần chạy multistep cho kết quả giống hệt nhau."""
+        from core.forecast import predict_xgboost_multistep
+
+        df = self._make_synthetic_series("2026-05-01", "2026-07-31")
+        origin = date(2026, 7, 31)
+        p1 = predict_xgboost_multistep(df, origin, horizon_days=14)
+        p2 = predict_xgboost_multistep(df, origin, horizon_days=14)
+        np.testing.assert_allclose(p1["yhat"].values, p2["yhat"].values, rtol=1e-6)
+        np.testing.assert_allclose(p1["yhat_lower"].values, p2["yhat_lower"].values, rtol=1e-6)
+        np.testing.assert_allclose(p1["yhat_upper"].values, p2["yhat_upper"].values, rtol=1e-6)
+
+    def test_backtest_script_does_not_mutate_fact_or_production(self):
+        """Đảm bảo script backtest chỉ đọc dữ liệu, không gọi ghi DB hay sửa Fact/ETL."""
+        from pathlib import Path
+
+        backtest_src = Path("scripts/eval_forecast_backtest.py").read_text(encoding="utf-8")
+        for forbidden in ("save_forecast_to_db", "run_forecast(", "INSERT ", "UPDATE ", "DELETE ", "ALTER "):
+            assert forbidden not in backtest_src
+
+    def test_save_forecast_to_db_idempotency_calls(self):
+        """Kiểm tra save_forecast_to_db xóa phạm vi cũ trước khi ghi mới (idempotent)."""
+        from unittest.mock import MagicMock
+        from core.forecast import save_forecast_to_db
+
+        executed_sql = []
+        mock_conn = MagicMock()
+
+        def capture_execute(stmt, params=None):
+            executed_sql.append(str(stmt))
+
+        mock_conn.execute.side_effect = capture_execute
+        mock_ctx = MagicMock()
+        mock_ctx.__enter__.return_value = mock_conn
+        mock_ctx.__exit__.return_value = False
+        mock_engine = MagicMock()
+        mock_engine.begin.return_value = mock_ctx
+
+        metrics = [{"model_name": "xgboost", "metric_name": "wape", "metric_value": 0.11}]
+        forecasts = [{
+            "target_date": date(2026, 8, 1),
+            "cinema_key": 1,
+            "time_slot": "Tối",
+            "model_name": "xgboost",
+            "yhat": 100.0,
+            "yhat_lower": 50.0,
+            "yhat_upper": 150.0,
+            "is_test": True,
+        }]
+
+        save_forecast_to_db(mock_engine, metrics, forecasts)
+        save_forecast_to_db(mock_engine, metrics, forecasts)
+
+        delete_metrics = [s for s in executed_sql if "DELETE FROM cinema_dw.model_metrics" in s]
+        delete_forecasts = [s for s in executed_sql if "DELETE FROM cinema_dw.forecast_result" in s]
+        insert_forecasts = [s for s in executed_sql if "INSERT INTO cinema_dw.forecast_result" in s]
+
+        assert len(delete_metrics) == 2
+        assert len(delete_forecasts) == 2
+        assert len(insert_forecasts) == 2
+
+
