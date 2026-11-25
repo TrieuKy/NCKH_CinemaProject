@@ -56,9 +56,11 @@ Cho phép **nhiều chủ đề trong một review**, phân tách bằng dấu c
 ## 4. Quy trình 2 Annotator độc lập & Giải quyết bất đồng
 
 1. **Gán nhãn độc lập**: Hai người nghiên cứu (`ANN_01` và `ANN_02`) gán nhãn **độc lập** trên cùng tập 165 review (không trao đổi trong lúc gán).
-2. **Đo độ đồng thuận (Inter-Annotator Agreement)**:
-   - Sau khi cả hai hoàn tất, chạy `python -m scripts.eval_reviews_nlp --input <file_ann1.csv> --annotator2 <file_ann2.csv>` để tính **Cohen's Kappa ($\kappa$)** cho `human_sentiment` và từng chủ đề.
-   - Chỉ tính Cohen's Kappa khi đã có đủ nhãn thực tế từ cả hai người gán.
+2. **Đo độ đồng thuận (Inter-Annotator Agreement) & Xuất danh sách bất đồng**:
+   - Sau khi cả hai hoàn tất (`annotation_status = DONE` với `annotator_id` khác nhau), chạy:
+     `python -m scripts.eval_reviews_nlp --input <file_ann1.csv> --annotator2 <file_ann2.csv> --export-disagreements data/review_annotation_disagreements.csv`
+   - Script tính **Cohen's Kappa ($\kappa$)** cho `human_sentiment` và từng chủ đề (chỉ tính khi đủ mẫu và phương sai khác 0; không bịa số khi không xác định).
    - Ngưỡng tham chiếu khoa học: $\kappa \ge 0.75$ (đồng thuận tốt).
-3. **Giải quyết bất đồng (Adjudication)**:
-   - Các dòng khác nhãn giữa `ANN_01` và `ANN_02` được đưa ra thảo luận cùng người thứ ba (Senior Researcher / Adjudicator) để chốt nhãn **Gold Standard** cuối cùng trước khi chạy đánh giá mô hình NLP.
+3. **Giải quyết bất đồng (Adjudication) & Gold Standard**:
+   - File `data/review_annotation_disagreements.csv` tự động đánh dấu `AGREED` cho các dòng đồng thuận và `PENDING_ADJUDICATION` cho các dòng bất đồng (để trống `final_sentiment`, `final_topics` — không tự chọn nhãn của `ANN_01` hay mô hình).
+   - Các dòng `PENDING_ADJUDICATION` được người thứ ba (Senior Researcher / Adjudicator) chốt `final_sentiment`, `final_topics` và đổi `adjudication_status` thành `ADJUDICATED` để tạo tập **Gold Standard** cuối cùng trước khi công bố F1 chính thức.
