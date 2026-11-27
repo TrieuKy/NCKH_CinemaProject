@@ -165,13 +165,19 @@ def test_rfm_k_mismatch_and_churn_risk():
 
 
 def test_forecast_peak_demand_and_missing_data_guard():
-    # Thiếu dữ liệu hoàn toàn -> FC-DATA-GAP
-    gap = evaluate_forecast_rules(pd.DataFrame(), expected_cinema_keys=[1, 2], cinema_name_map={1: "CN01", 2: "CN02"})
+    # 1. Thiếu dữ liệu hoàn toàn -> FC-DATA-GAP
+    ref = date(2026, 11, 25)
+    gap = evaluate_forecast_rules(
+        pd.DataFrame(),
+        expected_cinema_keys=[1, 2],
+        cinema_name_map={1: "CN01", 2: "CN02"},
+        reference_date=ref,
+    )
     assert len(gap) == 2
     assert all(d.rule_id == "FC-DATA-GAP" for d in gap)
 
-    # CN01 có đỉnh nhu cầu >= 80% capacity (400 * 0.8 = 320), CN02 thiếu dữ liệu
-    fc_df = pd.DataFrame(
+    # 2. Dữ liệu tháng 10/2026 dù created_at=2026-11-25 vẫn EXPIRED tại reference_date=2026-11-25
+    expired_df = pd.DataFrame(
         [
             {
                 "target_date": date(2026, 10, 3),
@@ -186,15 +192,46 @@ def test_forecast_peak_demand_and_missing_data_guard():
             }
         ]
     )
-    res = evaluate_forecast_rules(
-        fc_df,
-        cinema_capacity_map={1: 400, 2: 340},
+    exp_res = evaluate_forecast_rules(
+        expired_df,
         cinema_name_map={1: "CGV Landmark 81", 2: "CGV Vincom Đồng Khởi"},
         expected_cinema_keys=[1, 2],
+        reference_date=ref,
+    )
+    assert all(d.rule_id == "FC-DATA-GAP" for d in exp_res)
+    assert not any(d.rule_id == "FC-PEAK-DEMAND" for d in exp_res)
+
+    # 3. Dữ liệu tương lai đủ 14 ngày + có lịch chiếu xác nhận (400 ghế) -> FC-PEAK-DEMAND cho CN01, FC-DATA-GAP cho CN02
+    future_rows = []
+    sched_rows = []
+    for i in range(1, 15):
+        d = ref + timedelta(days=i)
+        future_rows.append(
+            {
+                "target_date": d,
+                "cinema_key": 1,
+                "time_slot": "Tối",
+                "model_name": "xgboost",
+                "yhat": 360.0 if i == 3 else 150.0,
+                "yhat_lower": 260.0,
+                "yhat_upper": 460.0,
+                "is_test": False,
+                "created_at": pd.Timestamp("2026-11-25"),
+            }
+        )
+        sched_rows.append({"show_date": d, "cinema_key": 1, "time_slot": "Tối", "capacity": 400})
+
+    res = evaluate_forecast_rules(
+        pd.DataFrame(future_rows),
+        cinema_name_map={1: "CGV Landmark 81", 2: "CGV Vincom Đồng Khởi"},
+        expected_cinema_keys=[1, 2],
+        reference_date=ref,
+        schedule_df=pd.DataFrame(sched_rows),
     )
     by_ck = {d.cinema_key: d for d in res}
     assert by_ck[1].rule_id == "FC-PEAK-DEMAND"
     assert by_ck[1].severity == "HIGH"
+    assert by_ck[1].evidence[0]["projected_occupancy_ratio"] == 0.9
     assert any("heuristic" in lim for lim in by_ck[1].limitations)
     assert by_ck[2].rule_id == "FC-DATA-GAP"
 
@@ -295,3 +332,172 @@ def test_deterministic_and_output_contract():
     assert rev_item["decision_id"].startswith("DSS-KPI-REV-DROP-")
     assert "customer_name" not in str(rev_item)
     assert "email" not in str(rev_item)
+
+
+# ---------------------------------------------------------------------------
+# Task 9.1 — Temporal Validity, Capacity Semantics, KPI & Data Completeness
+# ---------------------------------------------------------------------------
+def _make_14d_forecast(ref_date: date, cinema_key: int = 1, yhat: float = 360.0, slot: str = "Tối", created_at: str = "2026-11-25") -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "target_date": ref_date + timedelta(days=i),
+                "cinema_key": cinema_key,
+                "time_slot": slot,
+                "model_name": "xgboost",
+                "yhat": yhat,
+                "yhat_lower": max(0.0, yhat - 80.0),
+                "yhat_upper": yhat + 80.0,
+                "is_test": False,
+                "created_at": pd.Timestamp(created_at),
+            }
+            for i in range(1, 15)
+        ]
+    )
+
+
+def test_fix1_forecast_temporal_validity_expired_and_mixed_and_audit():
+    ref = date(2026, 11, 25)
+
+    # 1. Toàn bộ 2026-10-01..2026-10-14 với created_at mới (2026-11-25) -> vẫn expired
+    old_fc = pd.DataFrame(
+        [
+            {
+                "target_date": date(2026, 10, d),
+                "cinema_key": 1,
+                "time_slot": "Tối",
+                "model_name": "xgboost",
+                "yhat": 450.0,
+                "is_test": False,
+                "created_at": pd.Timestamp("2026-11-25"),
+            }
+            for d in range(1, 15)
+        ]
+    )
+    sched_old = pd.DataFrame(
+        [{"show_date": date(2026, 10, d), "cinema_key": 1, "time_slot": "Tối", "capacity": 400} for d in range(1, 15)]
+    )
+    res_op = evaluate_forecast_rules(old_fc, reference_date=ref, schedule_df=sched_old, expected_cinema_keys=[1])
+    assert not any(d.rule_id == "FC-PEAK-DEMAND" for d in res_op)
+    assert len(res_op) == 1
+    assert res_op[0].rule_id == "FC-DATA-GAP"
+    assert res_op[0].evidence[0]["reason"] == "all_forecasts_expired"
+
+    # 2. Historical audit mode cho phép replay nhưng gắn nhãn rõ ràng và giảm cấp
+    res_audit = evaluate_forecast_rules(
+        old_fc, reference_date=ref, schedule_df=sched_old, expected_cinema_keys=[1], mode="historical_audit"
+    )
+    peak_audit = [d for d in res_audit if d.rule_id == "FC-PEAK-DEMAND"]
+    assert len(peak_audit) == 1
+    assert peak_audit[0].title.startswith("[LỊCH SỬ / AUDIT]")
+    assert peak_audit[0].explanation["decision_mode"] == "HISTORICAL_AUDIT"
+    assert peak_audit[0].severity == "MEDIUM"
+
+    # 3. Hỗn hợp quá khứ + tương lai: chỉ phần tương lai được dùng
+    mixed_fc = pd.concat(
+        [
+            old_fc.iloc[:5],  # quá khứ
+            _make_14d_forecast(ref, cinema_key=1, yhat=360.0).iloc[:5],  # chỉ 5 ngày tương lai
+        ],
+        ignore_index=True,
+    )
+    sched_fut = pd.DataFrame(
+        [{"show_date": ref + timedelta(days=i), "cinema_key": 1, "time_slot": "Tối", "capacity": 400} for i in range(1, 6)]
+    )
+    res_mixed = evaluate_forecast_rules(mixed_fc, reference_date=ref, schedule_df=sched_fut, expected_cinema_keys=[1])
+    rule_ids = {d.rule_id for d in res_mixed}
+    assert "FC-PEAK-DEMAND" in rule_ids
+    assert "FC-DATA-GAP" in rule_ids  # thiếu 9/14 ngày horizon
+    peak_m = next(d for d in res_mixed if d.rule_id == "FC-PEAK-DEMAND")
+    assert peak_m.time_scope == f"{(ref + timedelta(days=1)).isoformat()}..{(ref + timedelta(days=5)).isoformat()}"
+
+
+def test_fix2_forecast_capacity_semantics_and_demand_surge():
+    ref = date(2026, 11, 25)
+    fc = _make_14d_forecast(ref, cinema_key=1, yhat=360.0, slot="Tối")
+
+    # 1. 360 vé / 400 ghế khả dụng (1 suất 400) -> 90% -> FC-PEAK-DEMAND
+    sched_400 = pd.DataFrame(
+        [{"show_date": ref + timedelta(days=i), "cinema_key": 1, "time_slot": "Tối", "capacity": 400} for i in range(1, 15)]
+    )
+    res_90 = evaluate_forecast_rules(fc, reference_date=ref, schedule_df=sched_400, expected_cinema_keys=[1])
+    assert len(res_90) == 1
+    assert res_90[0].rule_id == "FC-PEAK-DEMAND"
+    assert res_90[0].evidence[0]["projected_occupancy_ratio"] == 0.9
+
+    # 2. 360 vé / 800 ghế khả dụng (2 suất 400 cùng khung giờ) -> 45% -> không phát FC-PEAK-DEMAND
+    sched_800 = pd.DataFrame(
+        [
+            {"show_date": ref + timedelta(days=i), "cinema_key": 1, "time_slot": "Tối", "capacity": 400}
+            for i in range(1, 15)
+            for _ in range(2)
+        ]
+    )
+    res_45 = evaluate_forecast_rules(fc, reference_date=ref, schedule_df=sched_800, expected_cinema_keys=[1])
+    assert res_45 == []
+
+    # 3. Không có lịch chiếu -> không kết luận occupancy, không phát FC-PEAK-DEMAND
+    res_nosched = evaluate_forecast_rules(
+        fc, cinema_capacity_map={1: 400}, reference_date=ref, schedule_df=None, expected_cinema_keys=[1]
+    )
+    assert not any(d.rule_id == "FC-PEAK-DEMAND" for d in res_nosched)
+
+    # 4. Ngày không mở suất Sáng -> không tạo áp lực công suất giả cho Sáng
+    fc_morning = _make_14d_forecast(ref, cinema_key=1, yhat=380.0, slot="Sáng")
+    res_morning = evaluate_forecast_rules(fc_morning, reference_date=ref, schedule_df=sched_400, expected_cinema_keys=[1])
+    assert not any(d.rule_id == "FC-PEAK-DEMAND" for d in res_morning)
+
+    # 5. Không có lịch chiếu nhưng có lịch sử hợp lệ -> chỉ phát FC-DEMAND-SURGE (Demand Surge Alert)
+    hist_df = pd.DataFrame([{"cinema_key": 1, "time_slot": "Tối", "qty_clean": 200.0}])
+    res_surge = evaluate_forecast_rules(
+        fc, reference_date=ref, schedule_df=None, hist_slot_df=hist_df, expected_cinema_keys=[1]
+    )
+    assert len(res_surge) == 1
+    assert res_surge[0].rule_id == "FC-DEMAND-SURGE"
+    assert res_surge[0].severity == "MEDIUM"
+    assert res_surge[0].evidence[0]["schedule_available"] is False
+    assert "không mở thêm suất" in " ".join(res_surge[0].limitations).lower() or "mở thêm suất" in " ".join(res_surge[0].limitations).lower()
+
+
+def test_fix3_kpi_window_completeness_and_data_quality():
+    end_d = date(2026, 9, 30)
+    full_df = _make_daily_kpi(prev_rev=100_000_000.0, curr_rev=80_000_000.0, end_date=end_d)
+
+    # 1. 3 ngày vs 7 ngày -> không sinh KPI-REV-DROP giả, sinh KPI-DATA-GAP
+    df_3v7 = pd.concat([full_df.iloc[:7], full_df.iloc[11:14]], ignore_index=True)
+    res_3v7 = evaluate_kpi_rules(df_3v7)
+    assert not any(d.rule_id == "KPI-REV-DROP" for d in res_3v7)
+    assert any(d.rule_id == "KPI-DATA-GAP" for d in res_3v7)
+
+    # 2. Hai kỳ thiếu ngày ở vị trí khác nhau (6 ngày vs 6 ngày, giữ nguyên end_d)
+    df_6v6 = full_df.drop(index=[2, 10]).reset_index(drop=True)
+    res_6v6 = evaluate_kpi_rules(df_6v6)
+    assert not any(d.rule_id == "KPI-REV-DROP" for d in res_6v6)
+    gap_6v6 = next(d for d in res_6v6 if d.rule_id == "KPI-DATA-GAP")
+    assert gap_6v6.evidence[0]["days_current"] == 6
+    assert gap_6v6.evidence[0]["days_previous"] == 6
+
+    # 3. Trùng full_date
+    df_dup = pd.concat([full_df, full_df.iloc[[13]]], ignore_index=True)
+    res_dup = evaluate_kpi_rules(df_dup)
+    assert not any(d.rule_id == "KPI-REV-DROP" for d in res_dup)
+    gap_dup = next(d for d in res_dup if d.rule_id == "KPI-DATA-GAP")
+    assert "duplicate_full_date" in gap_dup.evidence[0]["reasons"]
+
+    # 4. NULL/NaN trong doanh thu sạch
+    df_nan = full_df.copy()
+    df_nan.loc[10, "ticket_revenue_clean"] = float("nan")
+    res_nan = evaluate_kpi_rules(df_nan)
+    assert not any(d.rule_id == "KPI-REV-DROP" for d in res_nan)
+    gap_nan = next(d for d in res_nan if d.rule_id == "KPI-DATA-GAP")
+    assert "null_or_nan_kpi" in gap_nan.evidence[0]["reasons"]
+
+
+def test_fix4_data_freshness_downgrades_stale_actionable_decisions():
+    # KPI cũ > 30 ngày -> giảm cấp CRITICAL -> HIGH, gắn nhãn HISTORICAL_ANALYSIS_ONLY
+    old_kpi = _make_daily_kpi(prev_rev=100_000_000.0, curr_rev=70_000_000.0, end_date=date(2026, 9, 30))
+    res = evaluate_kpi_rules(old_kpi, reference_date=date(2026, 11, 25))
+    assert len(res) == 1
+    assert res[0].severity == "HIGH"  # downgraded from CRITICAL
+    assert res[0].explanation["decision_mode"] == "HISTORICAL_ANALYSIS_ONLY"
+    assert res[0].evidence[0]["freshness"]["is_stale"] is True
