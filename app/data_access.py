@@ -583,41 +583,102 @@ def load_forecast_results(cinema_key: Optional[int] = None) -> pd.DataFrame:
         return _error_df("Không thể tải kết quả dự báo từ cơ sở dữ liệu.")
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def load_expected_cinemas() -> dict[int, str]:
+    """Lấy danh sách cụm rạp từ cinema_dw.dim_cinema (fallback về CINEMA_MAP)."""
+    try:
+        eng = _engine()
+        with eng.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT cinema_key, cinema_name FROM cinema_dw.dim_cinema ORDER BY cinema_key"
+            )).fetchall()
+        if rows:
+            return {int(r[0]): str(r[1]) for r in rows}
+    except Exception:
+        logger.warning("Fallback to CINEMA_MAP for expected cinemas", exc_info=True)
+    return dict(CINEMA_MAP)
+
+
+def _evaluate_source_freshness(
+    reference_date: date,
+    last_observed_date: Optional[date],
+    max_source_staleness_days: int,
+) -> tuple[str, Optional[int], bool, bool]:
+    """
+    Đánh giá độ tươi của dữ liệu nguồn theo nguyên tắc fail-closed:
+    - None / NaT -> ("MISSING", None, False, False)
+    - > reference_date -> ("FUTURE_DATE", age_days, False, False)
+    - age_days > max_source_staleness_days -> ("STALE", age_days, True, True)
+    - ngược lại -> ("FRESH", age_days, False, True)
+    Trả về (source_status, source_age_days, source_stale, source_verified).
+    """
+    if last_observed_date is None or pd.isna(last_observed_date):
+        return "MISSING", None, False, False
+    obs_date = last_observed_date.date() if isinstance(last_observed_date, (datetime, pd.Timestamp)) else last_observed_date
+    age_days = (reference_date - obs_date).days
+    if age_days < 0:
+        return "FUTURE_DATE", age_days, False, False
+    if age_days > max_source_staleness_days:
+        return "STALE", age_days, True, True
+    return "FRESH", age_days, False, True
+
+
 def analyze_forecast_status(
     fc_df: pd.DataFrame,
     reference_date: date,
     last_observed_date: Optional[date] = None,
     horizon_days: int = 14,
     max_source_staleness_days: int = 14,
+    expected_cinemas: Optional[dict[int, str] | list[int] | set[int]] = None,
+    selected_cinema_key: Optional[int] = None,
+    required_time_slots: Optional[list[str] | set[str]] = None,
 ) -> dict[str, Any]:
     """
     Phân tích trạng thái forecast theo đúng quy tắc khoa học:
     - Tách biệt is_test=True (test predictions) và is_test=False (future/production forecasts).
     - Horizon hợp lệ: (reference_date, reference_date + horizon_days].
-      Ngày thứ horizon_days + 1 trở đi không làm horizon hợp lệ.
-    - Đếm số ngày duy nhất (unique target_date), không đếm số dòng.
+      Ngày thứ horizon_days + 1 trở đi không làm horizon hợp lệ (OUT_OF_HORIZON).
+    - Fail-closed khi thiếu last_observed_date (SOURCE_UNVERIFIED) hoặc nguồn > reference_date.
+    - Kiểm tra độ đầy đủ theo từng cinema_key (và khung giờ bắt buộc nếu được cung cấp).
     - Đối chiếu data freshness giữa target_date, trained_at và last_observed_date.
     """
+    horizon_end = reference_date + timedelta(days=horizon_days)
+    source_status, source_age_days, source_stale, source_verified = _evaluate_source_freshness(
+        reference_date=reference_date,
+        last_observed_date=last_observed_date,
+        max_source_staleness_days=max_source_staleness_days,
+    )
+    obs_norm = (
+        last_observed_date.date()
+        if isinstance(last_observed_date, (datetime, pd.Timestamp))
+        else (None if last_observed_date is None or pd.isna(last_observed_date) else last_observed_date)
+    )
+
     if fc_df is None or fc_df.empty:
         return {
             "status": "NO_DATA",
             "is_operational_ready": False,
             "future_unique_days": 0,
-            "horizon_end": reference_date + timedelta(days=horizon_days),
+            "horizon_unique_days_any": 0,
+            "horizon_end": horizon_end,
             "min_target_date": None,
             "max_target_date": None,
             "future_min_date": None,
             "future_max_date": None,
             "trained_date": None,
-            "last_observed_date": last_observed_date,
-            "source_age_days": None,
-            "source_stale": False,
+            "last_observed_date": obs_norm,
+            "source_status": source_status,
+            "source_verified": source_verified,
+            "source_age_days": source_age_days,
+            "source_stale": source_stale,
             "has_duplicate_grain": False,
+            "cinema_coverage": {},
+            "all_cinemas_complete": False,
         }
 
     df = fc_df.copy()
     df["target_date"] = df["target_date"].apply(
-        lambda x: x.date() if isinstance(x, pd.Timestamp) else x
+        lambda x: x.date() if isinstance(x, (datetime, pd.Timestamp)) else x
     )
     if "is_test" not in df.columns:
         df["is_test"] = False
@@ -629,52 +690,131 @@ def analyze_forecast_status(
     ]
     has_duplicate_grain = bool(df.duplicated(subset=grain_cols).any()) if grain_cols else False
 
-    horizon_end = reference_date + timedelta(days=horizon_days)
     prod_df = df[~df["is_test"]]
     horizon_df = prod_df[
         (prod_df["target_date"] > reference_date)
         & (prod_df["target_date"] <= horizon_end)
     ]
-
-    future_unique_days = int(horizon_df["target_date"].nunique()) if not horizon_df.empty else 0
+    horizon_days_any = int(horizon_df["target_date"].nunique()) if not horizon_df.empty else 0
 
     trained_date: Optional[date] = None
     if "trained_at" in df.columns and df["trained_at"].notna().any():
         max_tr = pd.to_datetime(df["trained_at"]).max()
         trained_date = max_tr.date() if pd.notna(max_tr) else None
 
-    source_age_days: Optional[int] = None
-    source_stale = False
-    if last_observed_date is not None:
-        source_age_days = (reference_date - last_observed_date).days
-        source_stale = source_age_days > max_source_staleness_days
+    # Xác định phạm vi rạp cần kiểm tra
+    if selected_cinema_key is not None:
+        cinema_name = (
+            expected_cinemas.get(selected_cinema_key)
+            if isinstance(expected_cinemas, dict)
+            else CINEMA_MAP.get(selected_cinema_key, f"Cinema {selected_cinema_key}")
+        )
+        target_cinemas: dict[int, str] = {int(selected_cinema_key): str(cinema_name)}
+    elif isinstance(expected_cinemas, dict) and expected_cinemas:
+        target_cinemas = {int(k): str(v) for k, v in expected_cinemas.items()}
+    elif isinstance(expected_cinemas, (list, set, tuple)) and expected_cinemas:
+        target_cinemas = {int(k): CINEMA_MAP.get(int(k), f"Cinema {k}") for k in sorted(expected_cinemas)}
+    elif "cinema_key" in df.columns and df["cinema_key"].notna().any():
+        target_cinemas = {}
+        for ck in sorted(df["cinema_key"].dropna().astype(int).unique().tolist()):
+            cname = CINEMA_MAP.get(ck)
+            if not cname and "cinema_name" in df.columns:
+                sub = df.loc[df["cinema_key"] == ck, "cinema_name"].dropna()
+                cname = str(sub.iloc[0]) if not sub.empty else f"Cinema {ck}"
+            target_cinemas[ck] = cname or f"Cinema {ck}"
+    else:
+        target_cinemas = {0: "Tất cả rạp"}
+
+    expected_dates = [reference_date + timedelta(days=i) for i in range(1, horizon_days + 1)]
+    req_slots = sorted({str(s) for s in required_time_slots if s is not None}) if required_time_slots else []
+    check_slots = bool(req_slots) and ("time_slot" in horizon_df.columns)
+
+    cinema_coverage: dict[int, dict[str, Any]] = {}
+    common_dates: Optional[set[date]] = None
+
+    for ck, cname in target_cinemas.items():
+        if "cinema_key" in horizon_df.columns and ck != 0:
+            c_df = horizon_df[horizon_df["cinema_key"] == ck]
+        else:
+            c_df = horizon_df
+
+        present_dates = sorted(set(c_df["target_date"].tolist())) if not c_df.empty else []
+        present_set = set(present_dates)
+        missing_dates = [d for d in expected_dates if d not in present_set]
+
+        missing_slots_by_date: dict[date, list[str]] = {}
+        if check_slots and present_dates:
+            for d in present_dates:
+                day_slots = set(c_df.loc[c_df["target_date"] == d, "time_slot"].dropna().astype(str).tolist())
+                miss_s = [s for s in req_slots if s not in day_slots]
+                if miss_s:
+                    missing_slots_by_date[d] = miss_s
+
+        is_complete = (len(missing_dates) == 0) and (len(missing_slots_by_date) == 0)
+        cinema_coverage[ck] = {
+            "cinema_key": ck,
+            "cinema_name": cname,
+            "valid_days": len(present_dates),
+            "expected_days": horizon_days,
+            "missing_days": len(missing_dates),
+            "missing_dates": missing_dates,
+            "missing_slots_by_date": missing_slots_by_date,
+            "is_complete": is_complete,
+        }
+        common_dates = present_set if common_dates is None else (common_dates & present_set)
+
+    future_unique_days = len(common_dates) if common_dates is not None else 0
+    all_cinemas_complete = bool(cinema_coverage) and all(
+        info["is_complete"] for info in cinema_coverage.values()
+    )
 
     if prod_df.empty and df["is_test"].all():
-        # Chỉ có test predictions, không có future forecast
         status = "NO_FUTURE_FORECAST"
-    elif future_unique_days >= horizon_days:
-        status = "STALE_SOURCE" if source_stale else "VALID"
-    elif future_unique_days > 0:
-        status = "STALE_SOURCE" if source_stale else "PARTIAL"
+    elif horizon_days_any == 0:
+        has_past = bool((prod_df["target_date"] <= reference_date).any())
+        has_beyond = bool((prod_df["target_date"] > horizon_end).any())
+        if has_past and has_beyond:
+            status = "NO_VALID_HORIZON"
+        elif has_beyond:
+            status = "OUT_OF_HORIZON"
+        else:
+            status = "EXPIRED"
+    elif not source_verified:
+        status = "SOURCE_UNVERIFIED"
+    elif source_stale:
+        status = "STALE_SOURCE"
+    elif all_cinemas_complete:
+        status = "VALID"
     else:
-        status = "EXPIRED"
+        status = "PARTIAL"
 
-    is_operational_ready = (status == "VALID") and (not source_stale) and (not has_duplicate_grain)
+    is_operational_ready = (
+        (status == "VALID")
+        and source_verified
+        and (not source_stale)
+        and all_cinemas_complete
+        and (not has_duplicate_grain)
+    )
 
     return {
         "status": status,
         "is_operational_ready": is_operational_ready,
         "future_unique_days": future_unique_days,
+        "horizon_unique_days_any": horizon_days_any,
         "horizon_end": horizon_end,
         "min_target_date": df["target_date"].min(),
         "max_target_date": df["target_date"].max(),
         "future_min_date": prod_df["target_date"].min() if not prod_df.empty else None,
         "future_max_date": prod_df["target_date"].max() if not prod_df.empty else None,
         "trained_date": trained_date,
-        "last_observed_date": last_observed_date,
+        "last_observed_date": obs_norm,
+        "source_status": source_status,
+        "source_verified": source_verified,
         "source_age_days": source_age_days,
         "source_stale": source_stale,
         "has_duplicate_grain": has_duplicate_grain,
+        "cinema_coverage": cinema_coverage,
+        "all_cinemas_complete": all_cinemas_complete,
     }
 
 

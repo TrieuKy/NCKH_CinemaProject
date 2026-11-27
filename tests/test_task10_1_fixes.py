@@ -154,7 +154,8 @@ class TestFixBForecastUnit:
         df = self._make_fc(date(2026, 10, 15), days=14, slots=1, is_test=False)
         meta = analyze_forecast_status(df, reference_date=ref, last_observed_date=date(2026, 9, 30))
         assert meta["future_unique_days"] == 0
-        assert meta["status"] == "EXPIRED"
+        assert meta["status"] == "OUT_OF_HORIZON"
+        assert meta["is_operational_ready"] is False
 
     def test_test_predictions_not_counted_as_future(self):
         from app.data_access import analyze_forecast_status

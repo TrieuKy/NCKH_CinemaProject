@@ -36,8 +36,8 @@ from app.ui.charts import apply_chart_theme
 from app.ui.format import format_date, format_decimal
 from app.data_access import (
     load_forecast_results, load_forecast_model_metrics,
-    load_historical_tickets, load_data_date_range, CINEMA_MAP,
-    analyze_forecast_status, prepare_backtest_comparison,
+    load_historical_tickets, load_data_date_range, load_expected_cinemas,
+    CINEMA_MAP, analyze_forecast_status, prepare_backtest_comparison,
 )
 
 # ---------------------------------------------------------------------------
@@ -144,6 +144,7 @@ with st.spinner("Đang tải dữ liệu forecast từ PostgreSQL..."):
     fc_df       = load_forecast_results(fc_cinema_key)
     metrics_df  = load_forecast_model_metrics()
     min_dt, max_dt = load_data_date_range()
+    expected_cinemas = load_expected_cinemas() if fc_cinema_key is None else None
 
 if fc_df.attrs.get("db_error"):
     st.error("❌ ERROR / UNAVAILABLE: Không thể tải dữ liệu dự báo từ PostgreSQL.")
@@ -159,6 +160,8 @@ fc_meta = analyze_forecast_status(
     reference_date=today_ref,
     last_observed_date=max_dt,
     horizon_days=14,
+    expected_cinemas=expected_cinemas,
+    selected_cinema_key=fc_cinema_key,
 )
 fc_status = fc_meta["status"]
 max_target_date = fc_meta["max_target_date"]
@@ -170,29 +173,61 @@ future_days_count = fc_meta["future_unique_days"]
 # ---------------------------------------------------------------------------
 section_header("Trạng Thái Dự Báo & Data Freshness", icon="🔍")
 
+obs_display = format_date(fc_meta["last_observed_date"]) if fc_meta["last_observed_date"] else "N/A (MISSING)"
 freshness_msg = (
     f"• Ngày tham chiếu hiện tại: **{format_date(today_ref)}**\n"
     f"• Ngày chạy mô hình (`trained_at`): **{format_date(fc_meta['trained_date']) if fc_meta['trained_date'] else 'N/A'}**\n"
-    f"• Ngày cuối dữ liệu quan sát: **{format_date(fc_meta['last_observed_date']) if fc_meta['last_observed_date'] else 'N/A'}**"
+    f"• Ngày cuối dữ liệu quan sát: **{obs_display}** (`{fc_meta.get('source_status', 'UNKNOWN')}`)"
 )
 
 if fc_status == "VALID":
     notice(
-        f"✅ **FORECAST HỢP LỆ** — Có {future_days_count}/14 ngày duy nhất trong horizon "
-        f"({format_date(today_ref)} → {format_date(fc_meta['horizon_end'])}).\n\n{freshness_msg}",
+        f"✅ **FORECAST HỢP LỆ** — Đủ {future_days_count}/14 ngày duy nhất trong horizon "
+        f"({format_date(today_ref)} → {format_date(fc_meta['horizon_end'])}) cho toàn bộ phạm vi rạp đã chọn.\n\n{freshness_msg}",
         type="success",
+    )
+elif fc_status == "SOURCE_UNVERIFIED":
+    if fc_meta.get("source_status") == "FUTURE_DATE":
+        reason_src = (
+            f"ngày dữ liệu quan sát cuối ({format_date(fc_meta['last_observed_date'])}) "
+            f"nằm sau ngày tham chiếu ({format_date(today_ref)}) — không có cơ sở lịch sử hợp lệ."
+        )
+    else:
+        reason_src = "thiếu ngày dữ liệu quan sát cuối (`last_observed_date = NULL`)."
+    notice(
+        f"❌ **SOURCE UNVERIFIED — KHÔNG XÁC MINH ĐƯỢC DỮ LIỆU NGUỒN** — Dù có {fc_meta.get('horizon_unique_days_any', future_days_count)} ngày "
+        f"target trong horizon, {reason_src} **Fail-closed: không coi forecast là hợp lệ để vận hành.**\n\n{freshness_msg}",
+        type="danger",
     )
 elif fc_status == "STALE_SOURCE":
     notice(
-        f"⚠️ **STALE SOURCE — DỮ LIỆU NGUỒN QUÁ CŨ** — Dù có {future_days_count} ngày target tương lai, "
+        f"⚠️ **STALE SOURCE — DỮ LIỆU NGUỒN QUÁ CŨ** — Dù có {fc_meta.get('horizon_unique_days_any', future_days_count)} ngày target tương lai, "
         f"dữ liệu quan sát cuối cùng ({format_date(fc_meta['last_observed_date'])}) đã quá cũ "
         f"({fc_meta['source_age_days']} ngày). **Không dùng làm khuyến nghị vận hành hiện hành.**\n\n{freshness_msg}",
         type="danger",
     )
 elif fc_status == "PARTIAL":
     notice(
-        f"⚠️ **FORECAST KHÔNG ĐẦY ĐỦ (PARTIAL)** — Chỉ có {future_days_count}/14 ngày duy nhất trong horizon 14 ngày.\n\n{freshness_msg}",
+        f"⚠️ **FORECAST KHÔNG ĐẦY ĐỦ (PARTIAL)** — Độ phủ đồng bộ toàn phạm vi rạp: {future_days_count}/14 ngày "
+        f"(có {fc_meta.get('horizon_unique_days_any', future_days_count)} ngày có dữ liệu cục bộ trong horizon 14 ngày). "
+        f"Xem chi tiết từng rạp bên dưới.\n\n{freshness_msg}",
         type="warning",
+    )
+elif fc_status == "OUT_OF_HORIZON":
+    notice(
+        f"⚠️ **OUT OF HORIZON — NGOÀI KHUNG DỰ BÁO 14 NGÀY** — Có dữ liệu future forecast (`is_test=False`) từ "
+        f"**{format_date(fc_meta['future_min_date']) if fc_meta['future_min_date'] else 'N/A'}** "
+        f"đến **{format_date(fc_meta['future_max_date']) if fc_meta['future_max_date'] else 'N/A'}**, "
+        f"nhưng toàn bộ nằm ngoài horizon 14 ngày ({format_date(today_ref)} → {format_date(fc_meta['horizon_end'])}). "
+        f"**Không tham gia tính Operational Readiness.**\n\n{freshness_msg}",
+        type="danger",
+    )
+elif fc_status == "NO_VALID_HORIZON":
+    notice(
+        f"❌ **NO VALID HORIZON — KHÔNG CÓ NGÀY HỢP LỆ TRONG HORIZON 14 NGÀY** — Dữ liệu future forecast (`is_test=False`) "
+        f"chỉ chứa bản ghi quá khứ (≤ {format_date(today_ref)}) và bản ghi ngoài horizon (> {format_date(fc_meta['horizon_end'])}), "
+        f"thiếu hoàn toàn các ngày trong horizon yêu cầu.\n\n{freshness_msg}",
+        type="danger",
     )
 elif fc_status == "NO_FUTURE_FORECAST":
     notice(
@@ -221,9 +256,31 @@ with col_s1:
 with col_s2:
     kpi_card(title="Ngày target cuối (prod)", value=format_date(fc_meta["future_max_date"]) if fc_meta["future_max_date"] else "N/A")
 with col_s3:
-    kpi_card(title="Ngày tương lai trong horizon", value=future_days_count, unit="ngày")
+    kpi_card(title="Ngày đủ độ phủ horizon", value=future_days_count, unit="ngày")
 with col_s4:
-    kpi_card(title="Dữ liệu quan sát cuối", value=format_date(fc_meta["last_observed_date"]) if fc_meta["last_observed_date"] else "N/A")
+    kpi_card(title="Dữ liệu quan sát cuối", value=obs_display)
+
+# Bảng độ phủ horizon theo từng rạp
+cov_map = fc_meta.get("cinema_coverage") or {}
+if cov_map:
+    cov_rows = []
+    for ck, info in cov_map.items():
+        miss_list = info.get("missing_dates", [])
+        if not miss_list:
+            miss_str = "Không thiếu"
+        elif len(miss_list) > 5:
+            miss_str = f"{format_date(miss_list[0])} .. {format_date(miss_list[-1])} ({len(miss_list)} ngày)"
+        else:
+            miss_str = ", ".join(format_date(d) for d in miss_list)
+        cov_rows.append({
+            "Cụm rạp": info["cinema_name"],
+            "Ngày hợp lệ": f"{info['valid_days']}/{info['expected_days']}",
+            "Số ngày thiếu": info["missing_days"],
+            "Ngày thiếu trong horizon": miss_str,
+            "Trạng thái": "✅ Đủ" if info["is_complete"] else "⚠️ Thiếu",
+        })
+    st.caption("Độ phủ horizon 14 ngày theo từng cụm rạp:")
+    st.dataframe(pd.DataFrame(cov_rows), use_container_width=True, hide_index=True)
 
 # ---------------------------------------------------------------------------
 # MODEL METRICS
