@@ -13,14 +13,17 @@ Data Access Layer (DAL) dành riêng cho Streamlit Dashboard.
 
 from __future__ import annotations
 
+import logging
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Engine helper (singleton, không tạo kết nối mới mỗi lần rerun)
@@ -53,26 +56,54 @@ CINEMA_KEY_MAP = {
 }
 
 DEMO_ENABLED = os.environ.get("CINEMA_DEMO_MODE", "0").strip() == "1"
-DEMO_CREDENTIALS: dict[str, dict] = {}
-if DEMO_ENABLED:
-    DEMO_CREDENTIALS = {
-        "manager": {"user_id": "demo-manager-uuid", "username": "manager", "role": "MANAGER", "cinema_key": None},
-        "staff":   {"user_id": "demo-staff-uuid",   "username": "staff",   "role": "STAFF",   "cinema_key": 1},
-    }
+
+
+def enforce_cinema_scope(
+    user_role: str,
+    assigned_cinema_key: Optional[int],
+    requested_cinema_key: Optional[int] = None,
+) -> Optional[int]:
+    """
+    Fail-closed cinema scope enforcement cho DAL/UI.
+    - MANAGER: được phép xem toàn hệ thống (None) hoặc rạp hợp lệ bất kỳ.
+    - STAFF: bắt buộc có assigned_cinema_key hợp lệ trong CINEMA_MAP;
+      từ chối nếu thiếu, không hợp lệ, hoặc yêu cầu rạp khác phạm vi.
+    """
+    role_norm = str(user_role or "").strip().upper()
+    if role_norm == "MANAGER":
+        if requested_cinema_key is not None and requested_cinema_key not in CINEMA_MAP:
+            raise ValueError(f"cinema_key không hợp lệ: {requested_cinema_key}")
+        return requested_cinema_key
+    if role_norm == "STAFF":
+        if assigned_cinema_key is None or assigned_cinema_key not in CINEMA_MAP:
+            raise PermissionError("Tài khoản STAFF chưa được phân công cinema_key hợp lệ.")
+        if requested_cinema_key is not None and requested_cinema_key != assigned_cinema_key:
+            raise PermissionError("STAFF không có quyền truy cập dữ liệu rạp khác.")
+        return assigned_cinema_key
+    raise PermissionError(f"Vai trò không hợp lệ: {user_role}")
+
+
+def _error_df(message: str) -> pd.DataFrame:
+    """Trả về DataFrame rỗng có gắn cờ lỗi DB để phân biệt ERROR với NO_DATA."""
+    df = pd.DataFrame()
+    df.attrs["db_error"] = True
+    df.attrs["error_message"] = message
+    return df
 
 # ---------------------------------------------------------------------------
 # Kiểm tra kết nối PostgreSQL
 # ---------------------------------------------------------------------------
 
 def check_db_connection() -> tuple[bool, str]:
-    """Kiểm tra kết nối PostgreSQL. Trả về (ok, message)."""
+    """Kiểm tra kết nối PostgreSQL. Trả về (ok, message) không lộ credentials."""
     try:
         eng = _engine()
         with eng.connect() as conn:
             conn.execute(text("SELECT 1"))
         return True, "Kết nối PostgreSQL thành công."
-    except Exception as e:
-        return False, f"Lỗi kết nối PostgreSQL: {e}"
+    except Exception:
+        logger.exception("PostgreSQL connection check failed")
+        return False, "Không thể kết nối cơ sở dữ liệu PostgreSQL."
 
 
 # ---------------------------------------------------------------------------
@@ -129,9 +160,9 @@ def load_daily_kpi(
         if not df.empty:
             df["full_date"] = pd.to_datetime(df["full_date"]).dt.date
         return df
-    except Exception as e:
-        st.error(f"Lỗi tải KPI hàng ngày: {e}")
-        return pd.DataFrame()
+    except Exception:
+        logger.exception("Error loading daily KPI")
+        return _error_df("Không thể tải dữ liệu KPI hàng ngày từ cơ sở dữ liệu.")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -141,7 +172,8 @@ def load_kpi_summary(
     end_date: date,
 ) -> dict[str, Any]:
     """
-    Tổng hợp KPI cho KPI Cards: tổng doanh thu vé, F&B, số vé, ATP, occupancy tổng.
+    Tổng hợp KPI cho KPI Cards: tổng doanh thu vé, F&B, số vé, ATP, số ngày có giao dịch.
+    Phân biệt rõ status='OK', 'NO_DATA', và 'ERROR'.
     """
     try:
         eng = _engine()
@@ -165,17 +197,67 @@ def load_kpi_summary(
         """)
         with eng.connect() as conn:
             row = conn.execute(sql, params).fetchone()
-        if row:
+        data_days = int(row[4] or 0) if row else 0
+        if not row or data_days == 0:
             return {
-                "ticket_revenue_clean": float(row[0] or 0),
-                "fnb_revenue_clean":    float(row[1] or 0),
-                "ticket_qty_clean":     int(row[2] or 0),
-                "atp_clean":            float(row[3] or 0) if row[3] else None,
-                "data_days":            int(row[4] or 0),
+                "status": "NO_DATA",
+                "ticket_revenue_clean": 0.0,
+                "fnb_revenue_clean": 0.0,
+                "ticket_qty_clean": 0,
+                "atp_clean": None,
+                "data_days": 0,
             }
-    except Exception as e:
-        st.error(f"Lỗi tải KPI tổng hợp: {e}")
-    return {}
+        return {
+            "status": "OK",
+            "ticket_revenue_clean": float(row[0] or 0),
+            "fnb_revenue_clean":    float(row[1] or 0),
+            "ticket_qty_clean":     int(row[2] or 0),
+            "atp_clean":            float(row[3]) if row[3] is not None else None,
+            "data_days":            data_days,
+        }
+    except Exception:
+        logger.exception("Error loading KPI summary")
+        return {
+            "status": "ERROR",
+            "error": "Không thể tải KPI tổng hợp từ cơ sở dữ liệu.",
+        }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_kpi_coverage_by_cinema(
+    start_date: date,
+    end_date: date,
+) -> pd.DataFrame:
+    """
+    Kiểm tra phạm vi và độ phủ ngày có giao dịch theo từng rạp trong vw_daily_kpi.
+    Phân biệt số ngày có giao dịch (active_days) với số ngày lịch (calendar_days).
+    """
+    try:
+        eng = _engine()
+        params = _date_range_params(start_date, end_date)
+        calendar_days = max((end_date - start_date).days + 1, 0)
+        sql = text("""
+            SELECT
+                c.cinema_key,
+                c.cinema_name,
+                COUNT(DISTINCT k.full_date) AS active_days,
+                MIN(k.full_date) AS min_date,
+                MAX(k.full_date) AS max_date
+            FROM cinema_dw.dim_cinema c
+            LEFT JOIN cinema_dw.vw_daily_kpi k
+              ON c.cinema_key = k.cinema_key
+             AND k.date_key BETWEEN :start_key AND :end_key
+            GROUP BY c.cinema_key, c.cinema_name
+            ORDER BY c.cinema_key
+        """)
+        with eng.connect() as conn:
+            df = pd.read_sql(sql, conn, params=params)
+        if not df.empty:
+            df["calendar_days"] = calendar_days
+        return df
+    except Exception:
+        logger.exception("Error loading KPI coverage by cinema")
+        return _error_df("Không thể tải độ phủ dữ liệu KPI theo rạp.")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -190,12 +272,11 @@ def load_occupancy_summary(
     """
     try:
         eng = _engine()
-        cinema_clause = "AND o.cinema_key = :cinema_key" if cinema_key is not None else ""
+        cinema_clause = "AND dc.cinema_key = :cinema_key" if cinema_key is not None else ""
         params = _date_range_params(start_date, end_date)
         if cinema_key is not None:
             params["cinema_key"] = cinema_key
 
-        # Lấy cinema_key từ dim_room qua room_key của vw_showtime_occupancy
         sql = text(f"""
             SELECT
                 o.date_key,
@@ -222,9 +303,9 @@ def load_occupancy_summary(
         if not df.empty:
             df["full_date"] = pd.to_datetime(df["full_date"]).dt.date
         return df
-    except Exception as e:
-        st.error(f"Lỗi tải Occupancy: {e}")
-        return pd.DataFrame()
+    except Exception:
+        logger.exception("Error loading occupancy summary")
+        return _error_df("Không thể tải dữ liệu Occupancy từ cơ sở dữ liệu.")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -270,9 +351,9 @@ def load_fnb_attach_summary(
         if not df.empty:
             df["full_date"] = pd.to_datetime(df["full_date"]).dt.date
         return df
-    except Exception as e:
-        st.error(f"Lỗi tải F&B Attach: {e}")
-        return pd.DataFrame()
+    except Exception:
+        logger.exception("Error loading F&B attach summary")
+        return _error_df("Không thể tải dữ liệu F&B Attach từ cơ sở dữ liệu.")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -281,10 +362,15 @@ def load_anomaly_summary(
     start_date: date,
     end_date: date,
 ) -> dict[str, Any]:
-    """Thống kê bất thường trong khoảng ngày."""
+    """
+    Thống kê bất thường trong khoảng ngày từ vw_anomaly_showtime.
+    Join cinema_dw.dim_cinema qua cinema_name để lọc theo cinema_key
+    vì vw_anomaly_showtime không xuất cột cinema_key.
+    Phân biệt rõ status='OK', 'NO_DATA', và 'ERROR' (không trả KPI=0 khi lỗi SQL).
+    """
     try:
         eng = _engine()
-        cinema_clause = "AND an.cinema_key = :cinema_key" if cinema_key is not None else ""
+        cinema_clause = "AND dc.cinema_key = :cinema_key" if cinema_key is not None else ""
         params = _date_range_params(start_date, end_date)
         if cinema_key is not None:
             params["cinema_key"] = cinema_key
@@ -296,20 +382,32 @@ def load_anomaly_summary(
                 ROUND(COUNT(CASE WHEN an.is_anomaly_showtime THEN 1 END)::NUMERIC
                       / NULLIF(COUNT(*), 0) * 100, 2) AS anomaly_pct
             FROM cinema_dw.vw_anomaly_showtime an
+            JOIN cinema_dw.dim_cinema dc ON an.cinema_name = dc.cinema_name
             WHERE an.date_key BETWEEN :start_key AND :end_key
             {cinema_clause}
         """)
         with eng.connect() as conn:
             row = conn.execute(sql, params).fetchone()
-        if row:
+        total_showtimes = int(row[0] or 0) if row else 0
+        if total_showtimes == 0:
             return {
-                "total_showtimes":   int(row[0] or 0),
-                "anomaly_showtimes": int(row[1] or 0),
-                "anomaly_pct":       float(row[2] or 0),
+                "status": "NO_DATA",
+                "total_showtimes": 0,
+                "anomaly_showtimes": 0,
+                "anomaly_pct": None,
             }
-    except Exception as e:
-        st.error(f"Lỗi tải Anomaly: {e}")
-    return {}
+        return {
+            "status": "OK",
+            "total_showtimes": total_showtimes,
+            "anomaly_showtimes": int(row[1] or 0),
+            "anomaly_pct": float(row[2] or 0),
+        }
+    except Exception:
+        logger.exception("Error loading anomaly summary")
+        return {
+            "status": "ERROR",
+            "error": "Không thể tải thống kê bất thường từ cơ sở dữ liệu.",
+        }
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -349,9 +447,9 @@ def load_rfm_cluster_profile() -> pd.DataFrame:
         with eng.connect() as conn:
             df = pd.read_sql(sql, conn)
         return df
-    except Exception as e:
-        st.error(f"Lỗi tải RFM Cluster Profile: {e}")
-        return pd.DataFrame()
+    except Exception:
+        logger.exception("Error loading RFM cluster profile")
+        return _error_df("Không thể tải hồ sơ cụm RFM từ cơ sở dữ liệu.")
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -373,9 +471,9 @@ def load_rfm_distribution() -> pd.DataFrame:
         with eng.connect() as conn:
             df = pd.read_sql(sql, conn)
         return df
-    except Exception as e:
-        st.error(f"Lỗi tải RFM Distribution: {e}")
-        return pd.DataFrame()
+    except Exception:
+        logger.exception("Error loading RFM distribution")
+        return _error_df("Không thể tải phân bố RFM từ cơ sở dữ liệu.")
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -393,26 +491,53 @@ def load_rfm_model_metrics() -> pd.DataFrame:
         with eng.connect() as conn:
             df = pd.read_sql(sql, conn)
         return df
-    except Exception as e:
-        st.error(f"Lỗi tải RFM Model Metrics: {e}")
-        return pd.DataFrame()
+    except Exception:
+        logger.exception("Error loading RFM model metrics")
+        return _error_df("Không thể tải metrics mô hình RFM.")
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_rfm_dates() -> dict[str, Optional[date]]:
+    """
+    Trả về tách biệt:
+    - calculated_at: ngày chạy mô hình RFM (MAX(rfm_result.calculated_at)).
+    - last_member_txn_date: ngày giao dịch hội viên cuối cùng trong fact_ticket.
+    """
+    calculated_at: Optional[date] = None
+    last_member_txn_date: Optional[date] = None
+    try:
+        eng = _engine()
+        with eng.connect() as conn:
+            row_calc = conn.execute(text("""
+                SELECT MAX(calculated_at) FROM cinema_dw.rfm_result
+            """)).fetchone()
+            if row_calc and row_calc[0]:
+                d = row_calc[0]
+                calculated_at = d.date() if hasattr(d, "date") else d
+
+            row_txn = conn.execute(text("""
+                SELECT MAX(d.full_date)
+                FROM cinema_dw.fact_ticket t
+                JOIN cinema_dw.dim_date d ON t.date_key = d.date_key
+                JOIN cinema_dw.dim_customer c ON t.customer_key = c.customer_key
+                WHERE c.is_guest = FALSE
+                  AND t.is_anomaly = 0
+            """)).fetchone()
+            if row_txn and row_txn[0]:
+                d2 = row_txn[0]
+                last_member_txn_date = d2.date() if hasattr(d2, "date") else d2
+    except Exception:
+        logger.exception("Error loading RFM dates")
+    return {
+        "calculated_at": calculated_at,
+        "last_member_txn_date": last_member_txn_date,
+    }
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_rfm_as_of_date() -> Optional[date]:
-    """Lấy ngày dữ liệu RFM gần nhất."""
-    try:
-        eng = _engine()
-        with eng.connect() as conn:
-            row = conn.execute(text("""
-                SELECT MAX(calculated_at) FROM cinema_dw.rfm_result
-            """)).fetchone()
-        if row and row[0]:
-            d = row[0]
-            return d.date() if hasattr(d, "date") else d
-    except Exception:
-        pass
-    return None
+    """Lấy ngày chạy mô hình RFM gần nhất (giữ tương thích ngược)."""
+    return load_rfm_dates().get("calculated_at")
 
 
 # ---------------------------------------------------------------------------
@@ -421,35 +546,201 @@ def load_rfm_as_of_date() -> Optional[date]:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_forecast_results(cinema_key: Optional[int] = None) -> pd.DataFrame:
-    """Tải kết quả dự báo từ forecast_result."""
+    """Tải kết quả dự báo từ forecast_result kèm is_test, metric_type và trained_date."""
     try:
         eng = _engine()
         cinema_clause = "WHERE f.cinema_key = :cinema_key" if cinema_key is not None else ""
         params = {"cinema_key": cinema_key} if cinema_key is not None else {}
         sql = text(f"""
             SELECT
+                f.forecast_id,
                 f.target_date,
                 f.cinema_key,
                 c.cinema_name,
                 f.time_slot,
+                f.model_name,
+                f.metric_type,
                 f.yhat,
                 f.yhat_lower,
                 f.yhat_upper,
-                f.model_name,
+                f.is_test,
                 f.created_at AS trained_at
             FROM cinema_dw.forecast_result f
             JOIN cinema_dw.dim_cinema c ON f.cinema_key = c.cinema_key
             {cinema_clause}
-            ORDER BY f.target_date, f.cinema_key, f.time_slot
+            ORDER BY f.target_date, f.cinema_key, f.time_slot, f.model_name
         """)
         with eng.connect() as conn:
             df = pd.read_sql(sql, conn, params=params)
         if not df.empty:
             df["target_date"] = pd.to_datetime(df["target_date"]).dt.date
+            df["is_test"] = df["is_test"].fillna(False).astype(bool)
+            if "trained_at" in df.columns:
+                df["trained_date"] = pd.to_datetime(df["trained_at"]).dt.date
         return df
-    except Exception as e:
-        st.error(f"Lỗi tải Forecast: {e}")
-        return pd.DataFrame()
+    except Exception:
+        logger.exception("Error loading forecast results")
+        return _error_df("Không thể tải kết quả dự báo từ cơ sở dữ liệu.")
+
+
+def analyze_forecast_status(
+    fc_df: pd.DataFrame,
+    reference_date: date,
+    last_observed_date: Optional[date] = None,
+    horizon_days: int = 14,
+    max_source_staleness_days: int = 14,
+) -> dict[str, Any]:
+    """
+    Phân tích trạng thái forecast theo đúng quy tắc khoa học:
+    - Tách biệt is_test=True (test predictions) và is_test=False (future/production forecasts).
+    - Horizon hợp lệ: (reference_date, reference_date + horizon_days].
+      Ngày thứ horizon_days + 1 trở đi không làm horizon hợp lệ.
+    - Đếm số ngày duy nhất (unique target_date), không đếm số dòng.
+    - Đối chiếu data freshness giữa target_date, trained_at và last_observed_date.
+    """
+    if fc_df is None or fc_df.empty:
+        return {
+            "status": "NO_DATA",
+            "is_operational_ready": False,
+            "future_unique_days": 0,
+            "horizon_end": reference_date + timedelta(days=horizon_days),
+            "min_target_date": None,
+            "max_target_date": None,
+            "future_min_date": None,
+            "future_max_date": None,
+            "trained_date": None,
+            "last_observed_date": last_observed_date,
+            "source_age_days": None,
+            "source_stale": False,
+            "has_duplicate_grain": False,
+        }
+
+    df = fc_df.copy()
+    df["target_date"] = df["target_date"].apply(
+        lambda x: x.date() if isinstance(x, pd.Timestamp) else x
+    )
+    if "is_test" not in df.columns:
+        df["is_test"] = False
+    df["is_test"] = df["is_test"].fillna(False).astype(bool)
+
+    grain_cols = [
+        c for c in ["target_date", "cinema_key", "time_slot", "model_name", "is_test", "metric_type"]
+        if c in df.columns
+    ]
+    has_duplicate_grain = bool(df.duplicated(subset=grain_cols).any()) if grain_cols else False
+
+    horizon_end = reference_date + timedelta(days=horizon_days)
+    prod_df = df[~df["is_test"]]
+    horizon_df = prod_df[
+        (prod_df["target_date"] > reference_date)
+        & (prod_df["target_date"] <= horizon_end)
+    ]
+
+    future_unique_days = int(horizon_df["target_date"].nunique()) if not horizon_df.empty else 0
+
+    trained_date: Optional[date] = None
+    if "trained_at" in df.columns and df["trained_at"].notna().any():
+        max_tr = pd.to_datetime(df["trained_at"]).max()
+        trained_date = max_tr.date() if pd.notna(max_tr) else None
+
+    source_age_days: Optional[int] = None
+    source_stale = False
+    if last_observed_date is not None:
+        source_age_days = (reference_date - last_observed_date).days
+        source_stale = source_age_days > max_source_staleness_days
+
+    if prod_df.empty and df["is_test"].all():
+        # Chỉ có test predictions, không có future forecast
+        status = "NO_FUTURE_FORECAST"
+    elif future_unique_days >= horizon_days:
+        status = "STALE_SOURCE" if source_stale else "VALID"
+    elif future_unique_days > 0:
+        status = "STALE_SOURCE" if source_stale else "PARTIAL"
+    else:
+        status = "EXPIRED"
+
+    is_operational_ready = (status == "VALID") and (not source_stale) and (not has_duplicate_grain)
+
+    return {
+        "status": status,
+        "is_operational_ready": is_operational_ready,
+        "future_unique_days": future_unique_days,
+        "horizon_end": horizon_end,
+        "min_target_date": df["target_date"].min(),
+        "max_target_date": df["target_date"].max(),
+        "future_min_date": prod_df["target_date"].min() if not prod_df.empty else None,
+        "future_max_date": prod_df["target_date"].max() if not prod_df.empty else None,
+        "trained_date": trained_date,
+        "last_observed_date": last_observed_date,
+        "source_age_days": source_age_days,
+        "source_stale": source_stale,
+        "has_duplicate_grain": has_duplicate_grain,
+    }
+
+
+def prepare_backtest_comparison(
+    fc_df: pd.DataFrame,
+    actual_df: pd.DataFrame,
+    selected_model: Optional[str] = None,
+    metric_type: str = "tickets",
+) -> tuple[pd.DataFrame, Optional[str]]:
+    """
+    Chuẩn bị dữ liệu hậu kiểm Forecast vs Actual ở đúng grain:
+    - Lọc theo metric_type (mặc định 'tickets' để khớp ticket_qty_clean).
+    - Kiểm tra trùng lặp tại grain (target_date, cinema_key, time_slot, model_name, is_test, metric_type).
+    - Không bao giờ cộng yhat của nhiều model_name khác nhau thành một đường.
+    Trả về (merged_df, warning_or_error_msg).
+    """
+    if fc_df is None or fc_df.empty:
+        return pd.DataFrame(), "Không có dữ liệu dự báo để hậu kiểm."
+
+    df = fc_df.copy()
+    df["target_date"] = pd.to_datetime(df["target_date"]).dt.date
+
+    if "metric_type" in df.columns:
+        df = df[df["metric_type"] == metric_type]
+        if df.empty:
+            return pd.DataFrame(), f"Không có dữ liệu dự báo cho metric_type='{metric_type}'."
+
+    if selected_model:
+        df = df[df["model_name"] == selected_model]
+        if df.empty:
+            return pd.DataFrame(), f"Không có dữ liệu cho mô hình '{selected_model}'."
+
+    grain_cols = [
+        c for c in ["target_date", "cinema_key", "time_slot", "model_name", "is_test", "metric_type"]
+        if c in df.columns
+    ]
+    if grain_cols and df.duplicated(subset=grain_cols).any():
+        return pd.DataFrame(), (
+            "Phát hiện bản ghi trùng tại grain (target_date × cinema × time_slot × model_name × is_test × metric_type). "
+            "Từ chối tổng hợp để tránh cộng trùng dự báo."
+        )
+
+    # Nếu cùng (target_date, cinema_key, time_slot, model_name) có cả is_test=True và is_test=False,
+    # phải giữ phân biệt hoặc chỉ lấy nhóm không trùng chéo trước khi sum theo ngày × model_name.
+    per_slot_cols = [c for c in ["target_date", "cinema_key", "time_slot", "model_name", "metric_type"] if c in df.columns]
+    if per_slot_cols and df.duplicated(subset=per_slot_cols).any():
+        return pd.DataFrame(), (
+            "Phát hiện chồng lấn giữa bản ghi test và production trên cùng slot × mô hình. "
+            "Vui lòng lọc rõ loại dự báo trước khi tổng hợp."
+        )
+
+    fc_agg = (
+        df.groupby(["target_date", "model_name"], as_index=False)
+        .agg(yhat_total=("yhat", "sum"))
+    )
+    fc_agg["date"] = pd.to_datetime(fc_agg["target_date"])
+
+    if actual_df is None or actual_df.empty:
+        return fc_agg, None
+
+    act = actual_df.copy()
+    act["date"] = pd.to_datetime(act["full_date"])
+    act_agg = act.groupby("date", as_index=False).agg(actual_total=("ticket_qty_clean", "sum"))
+
+    merged = pd.merge(fc_agg, act_agg, on="date", how="left").sort_values(["model_name", "date"])
+    return merged, None
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -468,9 +759,9 @@ def load_forecast_model_metrics() -> pd.DataFrame:
         with eng.connect() as conn:
             df = pd.read_sql(sql, conn)
         return df
-    except Exception as e:
-        st.error(f"Lỗi tải Forecast Model Metrics: {e}")
-        return pd.DataFrame()
+    except Exception:
+        logger.exception("Error loading forecast model metrics")
+        return _error_df("Không thể tải metrics mô hình dự báo.")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -499,9 +790,9 @@ def load_historical_tickets(
         if not df.empty:
             df["full_date"] = pd.to_datetime(df["full_date"]).dt.date
         return df
-    except Exception as e:
-        st.error(f"Lỗi tải lịch sử vé: {e}")
-        return pd.DataFrame()
+    except Exception:
+        logger.exception("Error loading historical tickets")
+        return _error_df("Không thể tải lịch sử vé bán.")
 
 
 # ---------------------------------------------------------------------------
@@ -509,11 +800,16 @@ def load_historical_tickets(
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_review_summary() -> pd.DataFrame:
-    """Tổng hợp số lượng review và sentiment theo rạp."""
+def load_review_summary(cinema_key: Optional[int] = None) -> pd.DataFrame:
+    """
+    Tổng hợp số lượng review và sentiment theo rạp.
+    Hỗ trợ lọc cinema_key trực tiếp trong SQL để đảm bảo STAFF chỉ đọc rạp được phân công.
+    """
     try:
         eng = _engine()
-        sql = text("""
+        cinema_clause = "WHERE rr.cinema_key = :cinema_key" if cinema_key is not None else ""
+        params = {"cinema_key": cinema_key} if cinema_key is not None else {}
+        sql = text(f"""
             SELECT
                 rr.cinema_key,
                 c.cinema_name,
@@ -527,15 +823,16 @@ def load_review_summary() -> pd.DataFrame:
             FROM cinema_dw.review_raw rr
             JOIN cinema_dw.dim_cinema c ON rr.cinema_key = c.cinema_key
             LEFT JOIN cinema_dw.review_nlp nl ON rr.review_id = nl.review_id
+            {cinema_clause}
             GROUP BY rr.cinema_key, c.cinema_name
             ORDER BY rr.cinema_key
         """)
         with eng.connect() as conn:
-            df = pd.read_sql(sql, conn)
+            df = pd.read_sql(sql, conn, params=params)
         return df
-    except Exception as e:
-        st.error(f"Lỗi tải Review Summary: {e}")
-        return pd.DataFrame()
+    except Exception:
+        logger.exception("Error loading review summary")
+        return _error_df("Không thể tải tổng hợp review từ cơ sở dữ liệu.")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -569,14 +866,14 @@ def load_review_nlp_detail(cinema_key: Optional[int] = None, limit: int = 200) -
         with eng.connect() as conn:
             df = pd.read_sql(sql, conn, params=params)
         return df
-    except Exception as e:
-        st.error(f"Lỗi tải Review Detail: {e}")
-        return pd.DataFrame()
+    except Exception:
+        logger.exception("Error loading review NLP detail")
+        return _error_df("Không thể tải chi tiết review từ cơ sở dữ liệu.")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_topic_distribution(cinema_key: Optional[int] = None) -> pd.DataFrame:
-    """Tải phân bố topics từ review_nlp (CN01 only)."""
+    """Tải phân bố topics từ review_nlp."""
     try:
         eng = _engine()
         cinema_clause = "AND rr.cinema_key = :cinema_key" if cinema_key is not None else ""
@@ -600,9 +897,28 @@ def load_topic_distribution(cinema_key: Optional[int] = None) -> pd.DataFrame:
         with eng.connect() as conn:
             df = pd.read_sql(sql, conn, params=params)
         return df
-    except Exception as e:
-        st.error(f"Lỗi tải Topic Distribution: {e}")
-        return pd.DataFrame()
+    except Exception:
+        logger.exception("Error loading topic distribution")
+        return _error_df("Không thể tải phân bố chủ đề review.")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_review_insights_data(cinema_key: int) -> pd.DataFrame:
+    """Tải dữ liệu review + NLP theo cinema_key phục vụ reviews/insights.py."""
+    try:
+        eng = _engine()
+        sql = text("""
+            SELECT rr.review_id, rr.cinema_key, rr.rating, rr.published_date,
+                   nl.sentiment_final, nl.topics
+            FROM cinema_dw.review_raw rr
+            LEFT JOIN cinema_dw.review_nlp nl ON rr.review_id = nl.review_id
+            WHERE rr.cinema_key = :ck
+        """)
+        with eng.connect() as conn:
+            return pd.read_sql(sql, conn, params={"ck": cinema_key})
+    except Exception:
+        logger.exception("Error loading review insights data")
+        return _error_df("Không thể tải dữ liệu insights review.")
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +938,6 @@ def load_app_users() -> pd.DataFrame:
         with eng.connect() as conn:
             df = pd.read_sql(sql, conn)
         return df
-    except Exception as e:
-        st.error(f"Lỗi tải App Users: {e}")
-        return pd.DataFrame()
+    except Exception:
+        logger.exception("Error loading app users")
+        return _error_df("Không thể tải danh sách tài khoản.")

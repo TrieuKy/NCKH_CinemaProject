@@ -14,6 +14,7 @@ Thư viện thành phần giao diện dùng chung (UI Components):
 
 from __future__ import annotations
 
+import html as _html
 import io
 from typing import Any, Callable, Sequence
 import pandas as pd
@@ -193,15 +194,18 @@ def kpi_card(
             color_class = "delta-up"
         delta_html = f'<div class="kpi-delta {color_class}">{d_info["text"]} so với kỳ trước</div>'
 
-    help_attr = f'title="{card_help}"' if card_help else ""
+    safe_title = _html.escape(str(card_title))
+    safe_val = _html.escape(str(val_str))
+    safe_help = _html.escape(str(card_help), quote=True) if card_help else ""
+    help_attr = f'title="{safe_help}"' if safe_help else ""
 
     html = f"""
     <div class="kpi-card" {help_attr}>
         <div class="kpi-title">
-            <span>{card_title}</span>
-            {"<span style='cursor:help; font-size:12px;'>ⓘ</span>" if card_help else ""}
+            <span>{safe_title}</span>
+            {"<span style='cursor:help; font-size:12px;'>ⓘ</span>" if safe_help else ""}
         </div>
-        <div class="kpi-value">{val_str}</div>
+        <div class="kpi-value">{safe_val}</div>
         {delta_html}
     </div>
     """
@@ -278,11 +282,11 @@ def data_source_tag(source: str = "MOCK") -> str:
 
 def section_header(title: str, subtitle: str | None = None, icon: str | None = None) -> None:
     """Hiển thị tiêu đề phân mục có đường kẻ ngăn cách nhẹ."""
-    icon_part = f"<span>{icon}</span> " if icon else ""
-    sub_part = f'<div class="section-subtitle">{subtitle}</div>' if subtitle else ""
+    icon_part = f"<span>{_html.escape(str(icon))}</span> " if icon else ""
+    sub_part = f'<div class="section-subtitle">{_html.escape(str(subtitle))}</div>' if subtitle else ""
     html = f"""
     <div class="section-header-box">
-        <h3 class="section-title">{icon_part}{title}</h3>
+        <h3 class="section-title">{icon_part}{_html.escape(str(title))}</h3>
         {sub_part}
     </div>
     """
@@ -296,7 +300,9 @@ def summary_line(items: Sequence[tuple[str, Any]]) -> None:
     """
     items_html = []
     for label, val in items:
-        items_html.append(f'<span class="summary-item">{label}: <strong>{val}</strong></span>')
+        items_html.append(
+            f'<span class="summary-item">{_html.escape(str(label))}: <strong>{_html.escape(str(val))}</strong></span>'
+        )
     full_html = f'<div class="summary-strip">{" ".join(items_html)}</div>'
     st.markdown(full_html, unsafe_allow_html=True)
 

@@ -10,6 +10,7 @@ app/main.py
 
 from __future__ import annotations
 
+import html as _html
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -45,6 +46,8 @@ from app.ui.auth import (
     is_authenticated,
     get_current_user,
     authenticate_user,
+    authenticate_demo_user,
+    is_demo_mode_enabled,
     hash_password,
 )
 
@@ -97,8 +100,11 @@ def render_standard_filters(
         # 1. Bộ lọc Rạp
         if show_cinema:
             with cols[0]:
-                if user_role == "STAFF" and fixed_cinema_key:
-                    cinema_name = CINEMA_MAP.get(fixed_cinema_key, f"Rạp ID {fixed_cinema_key}")
+                if user_role == "STAFF":
+                    if fixed_cinema_key not in CINEMA_MAP:
+                        st.error("⛔ Tài khoản STAFF chưa được phân công cụm rạp hợp lệ.")
+                        st.stop()
+                    cinema_name = CINEMA_MAP[fixed_cinema_key]
                     st.selectbox(
                         "Cụm rạp phân công:",
                         options=[cinema_name],
@@ -234,28 +240,10 @@ def render_login_screen() -> None:
                         with st.spinner("Đang xác thực tài khoản..."):
                             user = authenticate_user(username, password)
 
-                            # Chế độ DEMO: chỉ bật khi biến môi trường CINEMA_DEMO_MODE=1
-                            # KHÔNG được kích hoạt mặc định trong vận hành.
-                            import os as _os
-                            _demo_mode = _os.environ.get("CINEMA_DEMO_MODE", "0").strip() == "1"
-                            if not user and _demo_mode:
-                                _DEMO_USERS = {
-                                    ("manager", "manager123"): {
-                                        "user_id": "demo-manager-uuid",
-                                        "username": "manager",
-                                        "role": "MANAGER",
-                                        "cinema_key": None,
-                                        "login_time": datetime.now(),
-                                    },
-                                    ("staff", "staff123"): {
-                                        "user_id": "demo-staff-uuid",
-                                        "username": "staff",
-                                        "role": "STAFF",
-                                        "cinema_key": 1,
-                                        "login_time": datetime.now(),
-                                    },
-                                }
-                                user = _DEMO_USERS.get((username, password))
+                            # Chế độ DEMO: chỉ bật tường minh khi CINEMA_DEMO_MODE=1
+                            # và đọc cấu hình từ bên ngoài repo (không hardcode mật khẩu).
+                            if not user and is_demo_mode_enabled():
+                                user = authenticate_demo_user(username, password)
 
                             if user:
                                 login_user(user)
@@ -265,15 +253,12 @@ def render_login_screen() -> None:
                                 st.error("❌ Tên đăng nhập hoặc mật khẩu không chính xác.")
 
         # Thông tin hướng dẫn đăng nhập
-        import os as _os2
-        _demo_mode_ui = _os2.environ.get("CINEMA_DEMO_MODE", "0").strip() == "1"
-        if _demo_mode_ui:
+        if is_demo_mode_enabled():
             st.markdown(
                 """
                 <div style="margin-top:20px; padding:12px 14px; background:#FFFBEB; border:1px dashed #FDE68A; border-radius:8px; font-size:12px; color:#92400E;">
                     <strong>⚠️ Chế độ DEMO đang bật (CINEMA_DEMO_MODE=1):</strong><br>
-                    • Quản lý tổng: <code>manager</code> / <code>manager123</code> (Vai trò: MANAGER)<br>
-                    • Nhân viên rạp: <code>staff</code> / <code>staff123</code> (Vai trò: STAFF - Rạp Landmark 81)<br>
+                    Tài khoản demo được nạp từ cấu hình bên ngoài repository (<code>CINEMA_DEMO_USERS_JSON</code> hoặc <code>CINEMA_DEMO_CONFIG_PATH</code>).<br>
                     <em>Chế độ demo chỉ dùng cho nghiên cứu — tắt biến môi trường khi vận hành thật.</em>
                 </div>
                 """,
@@ -324,12 +309,15 @@ def render_sidebar_navigation(user: dict[str, Any]) -> None:
             badge("QUẢN LÝ", level="warning") if role == "MANAGER" else badge("NHÂN VIÊN", level="info")
         )
 
+        safe_username = _html.escape(str(username))
+        safe_cinema_info = _html.escape(str(cinema_info))
+
         st.markdown(
             f"""
             <div class="sidebar-user-card">
-                <div class="sidebar-user-name">👤 {username}</div>
+                <div class="sidebar-user-name">👤 {safe_username}</div>
                 <div style="margin: 4px 0;">{role_badge}</div>
-                <div style="font-size:11px; color:#64748B; margin-top:4px;">{cinema_info}</div>
+                <div style="font-size:11px; color:#64748B; margin-top:4px;">{safe_cinema_info}</div>
                 <div style="font-size:10px; color:#94A3B8; margin-top:2px;">Phiên làm việc: 8 giờ</div>
             </div>
             """,

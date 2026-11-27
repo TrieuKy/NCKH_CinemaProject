@@ -16,6 +16,7 @@ Quy tắc nghiêm ngặt:
 
 from __future__ import annotations
 
+import html as _html
 import sys
 from pathlib import Path
 
@@ -35,7 +36,8 @@ from app.ui.components import (
 from app.ui.charts import apply_chart_theme, plot_sentiment_donut
 from app.ui.format import format_date, format_decimal, format_percent
 from app.data_access import (
-    load_review_summary, load_review_nlp_detail, load_topic_distribution, CINEMA_MAP,
+    load_review_summary, load_review_nlp_detail, load_topic_distribution,
+    load_review_insights_data, enforce_cinema_scope, CINEMA_MAP,
 )
 
 # ---------------------------------------------------------------------------
@@ -46,6 +48,13 @@ check_permission(required_role=["MANAGER", "STAFF"], auto_stop=True)
 user = get_current_user()
 role = user.get("role", "STAFF")
 user_cinema_key = user.get("cinema_key")  # None for MANAGER
+
+# FAIL-CLOSED STAFF AUTHORIZATION: từ chối ngay trước khi tải bất kỳ dữ liệu nào
+try:
+    scoped_cinema_key = enforce_cinema_scope(role, user_cinema_key, user_cinema_key if role == "STAFF" else None)
+except (PermissionError, ValueError) as auth_err:
+    st.error(f"⛔ Từ chối truy cập dữ liệu: {auth_err}")
+    st.stop()
 
 from app.main import render_sidebar_navigation  # type: ignore
 render_sidebar_navigation(user)
@@ -73,10 +82,14 @@ notice(
 )
 
 # ---------------------------------------------------------------------------
-# LOAD TỔNG HỢP REVIEW
+# LOAD TỔNG HỢP REVIEW (DAL giới hạn theo scoped_cinema_key cho STAFF)
 # ---------------------------------------------------------------------------
 with st.spinner("Đang tải dữ liệu review từ PostgreSQL..."):
-    summary_df = load_review_summary()
+    summary_df = load_review_summary(cinema_key=scoped_cinema_key)
+
+if summary_df.attrs.get("db_error"):
+    st.error("❌ ERROR / UNAVAILABLE: Không thể tải dữ liệu review từ PostgreSQL.")
+    st.stop()
 
 # ---------------------------------------------------------------------------
 # HIỂN THỊ THEO RẠP — TÁCH BIỆT RÕ RÀNG
@@ -90,17 +103,18 @@ notice(
 
 all_cinemas = {1: "CGV Landmark 81 (CN01)", 2: "CGV Vincom Đồng Khởi (CN02)", 3: "CGV Pearl Plaza (CN03)"}
 
-# STAFF bị giới hạn rạp
-visible_cinemas = all_cinemas
-if role == "STAFF" and user_cinema_key is not None:
-    visible_cinemas = {user_cinema_key: all_cinemas[user_cinema_key]}
-    notice(f"🔒 STAFF: Chỉ xem dữ liệu rạp được phân công — {all_cinemas[user_cinema_key]}", type="info")
+# STAFF bị giới hạn rạp (fail-closed)
+if role == "STAFF":
+    visible_cinemas = {scoped_cinema_key: all_cinemas[scoped_cinema_key]}
+    notice(f"🔒 STAFF: Chỉ xem dữ liệu rạp được phân công — {all_cinemas[scoped_cinema_key]}", type="info")
+else:
+    visible_cinemas = all_cinemas
 
 cols_cinema = st.columns(len(visible_cinemas))
 for col, (ck, cname) in zip(cols_cinema, visible_cinemas.items()):
     with col:
-        # Tìm trong summary_df
         cinema_row = summary_df[summary_df["cinema_key"] == ck] if not summary_df.empty else pd.DataFrame()
+        safe_cname = _html.escape(str(cname))
         if cinema_row.empty:
             st.markdown(f"**{cname}**")
             st.markdown(
@@ -114,7 +128,7 @@ for col, (ck, cname) in zip(cols_cinema, visible_cinemas.items()):
             )
         else:
             r = cinema_row.iloc[0]
-            st.markdown(f"**{cname}**")
+            st.markdown(f"**{safe_cname}**")
             kpi_card(
                 title="Tổng review",
                 value=int(r.get("total_reviews", 0)),
@@ -132,13 +146,13 @@ st.markdown("---")
 # ---------------------------------------------------------------------------
 # CHỌN RẠP ĐỂ PHÂN TÍCH CHI TIẾT
 # ---------------------------------------------------------------------------
-# Với STAFF, khoá rạp; với MANAGER, cho chọn
-if role == "STAFF" and user_cinema_key is not None:
-    selected_cinema_key = user_cinema_key
-    selected_cinema_name = all_cinemas.get(user_cinema_key, f"Rạp {user_cinema_key}")
+if role == "STAFF":
+    selected_cinema_key = scoped_cinema_key
+    selected_cinema_name = all_cinemas[scoped_cinema_key]
 else:
     sel_opt = st.selectbox("Chọn rạp để xem chi tiết:", list(visible_cinemas.values()), key="rev_cinema_sel")
-    selected_cinema_key = next((k for k, v in visible_cinemas.items() if v == sel_opt), None)
+    req_ck = next((k for k, v in visible_cinemas.items() if v == sel_opt), None)
+    selected_cinema_key = enforce_cinema_scope(role, user_cinema_key, req_ck)
     selected_cinema_name = sel_opt
 
 # Kiểm tra có dữ liệu không
@@ -163,30 +177,35 @@ with st.spinner(f"Đang tải chi tiết review cho {selected_cinema_name}..."):
 section_header(f"Phân Tích Chi Tiết — {selected_cinema_name}", icon="🔍")
 
 # ---------------------------------------------------------------------------
-# SENTIMENT DISTRIBUTION
+# SENTIMENT DISTRIBUTION (CÙNG PHẠM VI DỮ LIỆU VỚI TỔNG REVIEW TRONG summary_df)
 # ---------------------------------------------------------------------------
 col_sent, col_tbl = st.columns([1, 1])
+cinema_summary_row = summary_df[summary_df["cinema_key"] == selected_cinema_key] if not summary_df.empty else pd.DataFrame()
+total_reviews_cinema = int(cinema_summary_row.iloc[0].get("total_reviews", 0)) if not cinema_summary_row.empty else 0
+
 with col_sent:
     section_header("Phân Bố Sentiment (NLP Dự Đoán)", icon="💬")
-    if not nlp_df.empty and "sentiment_final" in nlp_df.columns:
-        sent_counts_raw = nlp_df["sentiment_final"].astype(str).str.upper().value_counts().to_dict()
-        # Map sang tiếng Việt
-        sent_map = {
-            "POSITIVE": "Tích cực",
-            "NEUTRAL":  "Trung tính",
-            "NEGATIVE": "Tiêu cực",
+    if not cinema_summary_row.empty:
+        r_sum = cinema_summary_row.iloc[0]
+        sent_counts = {
+            "Tích cực": int(r_sum.get("positive_count", 0) or 0),
+            "Trung tính": int(r_sum.get("neutral_count", 0) or 0),
+            "Tiêu cực": int(r_sum.get("negative_count", 0) or 0),
         }
-        sent_counts = {sent_map.get(k, k): v for k, v in sent_counts_raw.items()}
-        fig_sent = plot_sentiment_donut(
-            sent_counts,
-            title=f"Phân bố cảm xúc — {selected_cinema_name}",
-        )
-        st.plotly_chart(fig_sent, use_container_width=True)
-        notice(
-            "⚠️ Nhãn sentiment là **kết quả dự đoán NLP** (chưa có human ground truth). "
-            "Không dùng làm chỉ số đo lường chính thức.",
-            type="warning",
-        )
+        sent_counts = {k: v for k, v in sent_counts.items() if v > 0}
+        if sent_counts:
+            fig_sent = plot_sentiment_donut(
+                sent_counts,
+                title=f"Phân bố cảm xúc ({total_reviews_cinema:,} reviews) — {selected_cinema_name}",
+            )
+            st.plotly_chart(fig_sent, use_container_width=True)
+            notice(
+                "⚠️ Nhãn sentiment là **kết quả dự đoán NLP** (chưa có human ground truth). "
+                "Không dùng làm chỉ số đo lường chính thức.",
+                type="warning",
+            )
+        else:
+            empty_state("Không có dữ liệu sentiment NLP.")
     else:
         empty_state("Không có dữ liệu sentiment NLP.")
 
@@ -264,22 +283,11 @@ notice(
 
 try:
     from reviews.insights import generate_operational_insights  # type: ignore
-    from etl.db import get_engine  # type: ignore
     with st.spinner("Đang tải insights từ reviews/insights.py..."):
-        from sqlalchemy import text as _text
-        eng = get_engine()
-        with eng.connect() as conn:
-            rr = pd.read_sql(
-                _text("""
-                    SELECT rr.review_id, rr.cinema_key, rr.rating, rr.published_date,
-                           nl.sentiment_final, nl.topics
-                    FROM cinema_dw.review_raw rr
-                    LEFT JOIN cinema_dw.review_nlp nl ON rr.review_id = nl.review_id
-                    WHERE rr.cinema_key = :ck
-                """),
-                conn, params={"ck": selected_cinema_key}
-            )
-        if not rr.empty:
+        rr = load_review_insights_data(selected_cinema_key)
+        if rr.attrs.get("db_error"):
+            st.error("❌ ERROR / UNAVAILABLE: Không thể tải dữ liệu insights từ cơ sở dữ liệu.")
+        elif not rr.empty:
             insights = generate_operational_insights(rr)
             if insights:
                 for ins in insights[:5]:  # Giới hạn 5 insights
@@ -295,24 +303,28 @@ try:
                 empty_state("Không đủ dữ liệu để sinh insights (cần ≥ 10 reviews).")
         else:
             empty_state("Không có dữ liệu review để sinh insights.")
-except Exception as e:
-    notice(f"Không thể tải operational insights: {e}", type="warning")
+except Exception:
+    notice("Không thể tải operational insights từ module phân tích.", type="warning")
 
 # ---------------------------------------------------------------------------
-# CHI TIẾT REVIEW GỐC (MANAGER chỉ)
+# CHI TIẾT REVIEW GỐC (MANAGER chỉ — ghi rõ mẫu giới hạn 200 dòng)
 # ---------------------------------------------------------------------------
 if role == "MANAGER":
-    with st.expander(f"📋 Dữ liệu review gốc — {selected_cinema_name} (tối đa 200 dòng)", expanded=False):
+    sample_n = len(nlp_df) if not nlp_df.empty else 0
+    with st.expander(
+        f"📋 Mẫu dữ liệu review gốc — {selected_cinema_name} (mẫu {sample_n}/{total_reviews_cinema:,} reviews mới nhất)",
+        expanded=False,
+    ):
         if not nlp_df.empty:
             # Không lộ dữ liệu cá nhân (chỉ hiện review_id, rating, date, sentiment, topics)
             safe_cols = [c for c in [
                 "review_id", "cinema_name", "rating", "published_date",
                 "sentiment_final", "topics", "sentiment_score"
             ] if c in nlp_df.columns]
-            data_table(nlp_df[safe_cols], download_name="reviews_cn01.csv", key="review_detail")
+            data_table(nlp_df[safe_cols], download_name="reviews_sample.csv", key="review_detail")
             notice(
-                "⚠️ Dữ liệu review ẩn các thông tin định danh cá nhân (PII) không cần thiết "
-                "theo yêu cầu khoa học.", type="info"
+                f"⚠️ Bảng trên chỉ là **mẫu {sample_n}/{total_reviews_cinema:,} reviews mới nhất** (giới hạn 200 dòng) "
+                "và ẩn các thông tin định danh cá nhân (PII).", type="info"
             )
         else:
             empty_state("Không có dữ liệu review chi tiết.")

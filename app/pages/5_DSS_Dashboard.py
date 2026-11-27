@@ -117,15 +117,36 @@ notice(
 )
 
 # ---------------------------------------------------------------------------
-# CHẠY DSS
+# CHẠY DSS & KIỂM TRA NHẤT QUÁN SESSION STATE
 # ---------------------------------------------------------------------------
+current_dss_config = {
+    "cinema_key": dss_cinema_key,
+    "reference_date": dss_ref_date.isoformat() if hasattr(dss_ref_date, "isoformat") else str(dss_ref_date),
+    "mode": dss_mode,
+    "owner": user.get("user_id") or user.get("username"),
+}
+
 run_col, _ = st.columns([1, 3])
 with run_col:
     run_dss_btn = st.button("🚀 Chạy DSS Engine", type="primary", key="run_dss")
 
-if run_dss_btn or "dss_decisions" not in st.session_state:
+saved_config = st.session_state.get("dss_config")
+config_changed = (saved_config is not None) and (saved_config != current_dss_config)
+
+if config_changed and not run_dss_btn:
+    # Xóa kết quả cũ khi bộ lọc thay đổi và chưa bấm Run Again
+    if "dss_decisions" in st.session_state:
+        del st.session_state["dss_decisions"]
+    if "dss_error" in st.session_state:
+        del st.session_state["dss_error"]
+    st.warning(
+        "⚠️ **OUTDATED RESULT — RUN AGAIN**: Cấu hình bộ lọc (rạp, ngày tham chiếu hoặc chế độ) "
+        "đã thay đổi. Kết quả cũ đã được xóa — vui lòng nhấn **🚀 Chạy DSS Engine** để tính lại."
+    )
+    st.stop()
+
+if run_dss_btn or ("dss_decisions" not in st.session_state and not config_changed):
     if run_dss_btn:
-        # Xóa cache cũ khi chạy lại
         if "dss_decisions" in st.session_state:
             del st.session_state["dss_decisions"]
         if "dss_error" in st.session_state:
@@ -142,16 +163,18 @@ if run_dss_btn or "dss_decisions" not in st.session_state:
                 mode=dss_mode,
             )
             st.session_state["dss_decisions"] = decisions
+            st.session_state["dss_config"] = current_dss_config
             st.session_state["dss_error"] = None
-        except Exception as e:
+        except Exception:
             st.session_state["dss_decisions"] = []
-            st.session_state["dss_error"] = str(e)
+            st.session_state["dss_config"] = current_dss_config
+            st.session_state["dss_error"] = "Không thể chạy DSS Engine do lỗi kết nối hoặc truy vấn cơ sở dữ liệu."
 
 decisions = st.session_state.get("dss_decisions", [])
 dss_error  = st.session_state.get("dss_error")
 
 if dss_error:
-    st.error(f"❌ Lỗi khi chạy DSS Engine: {dss_error}")
+    st.error(f"❌ ERROR / UNAVAILABLE: {dss_error}")
     notice(
         "Kiểm tra kết nối PostgreSQL và cấu hình `etl/db.py`. "
         "Không có dữ liệu giả nào được tạo ra.",

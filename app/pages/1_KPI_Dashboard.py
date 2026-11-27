@@ -30,8 +30,9 @@ from app.ui.components import (
 from app.ui.charts import apply_chart_theme, plot_occupancy_heatmap
 from app.ui.format import format_currency, format_percent, format_decimal, format_date
 from app.data_access import (
-    load_daily_kpi, load_kpi_summary, load_occupancy_summary,
-    load_fnb_attach_summary, load_anomaly_summary, load_data_date_range,
+    load_daily_kpi, load_kpi_summary, load_kpi_coverage_by_cinema,
+    load_occupancy_summary, load_fnb_attach_summary, load_anomaly_summary,
+    load_data_date_range,
 )
 
 # ---------------------------------------------------------------------------
@@ -127,9 +128,15 @@ with st.spinner("Đang tải dữ liệu KPI từ PostgreSQL..."):
     occ_df      = load_occupancy_summary(cinema_key, start_d, end_d)
     fnb_df      = load_fnb_attach_summary(cinema_key, start_d, end_d)
     anom_sum    = load_anomaly_summary(cinema_key, start_d, end_d)
+    coverage_df = load_kpi_coverage_by_cinema(start_d, end_d)
+
+# Kiểm tra lỗi SQL trước khi kiểm tra empty state
+if kpi_summary.get("status") == "ERROR" or daily_df.attrs.get("db_error"):
+    st.error("❌ ERROR / UNAVAILABLE: Không thể tải dữ liệu KPI từ PostgreSQL. Vui lòng kiểm tra kết nối hoặc log hệ thống.")
+    st.stop()
 
 # Kiểm tra empty state
-if not kpi_summary or kpi_summary.get("data_days", 0) == 0:
+if kpi_summary.get("status") == "NO_DATA" or kpi_summary.get("data_days", 0) == 0:
     empty_state(
         f"Không có dữ liệu trong khoảng {format_date(start_d)} → {format_date(end_d)}.\n"
         f"Dữ liệu có sẵn từ {format_date(min_dt)} đến {format_date(max_dt)}.",
@@ -140,12 +147,25 @@ if not kpi_summary or kpi_summary.get("data_days", 0) == 0:
 # ---------------------------------------------------------------------------
 # 7. KPI CARDS
 # ---------------------------------------------------------------------------
+calendar_days = max((end_d - start_d).days + 1, 0)
+active_days = kpi_summary.get("data_days", 0)
 section_header("Chỉ Số KPI Tổng Hợp", icon="🎯")
 summary_line([
-    ("Số ngày có dữ liệu", f"{kpi_summary.get('data_days', 0)} ngày"),
+    ("Số ngày có giao dịch", f"{active_days} ngày"),
+    ("Số ngày lịch trong khoảng", f"{calendar_days} ngày"),
     ("Khoảng lọc", f"{format_date(start_d)} → {format_date(end_d)}"),
     ("Rạp", cinema_label),
 ])
+
+with st.expander("🔎 Đối chiếu phạm vi & độ phủ ngày có giao dịch theo từng rạp", expanded=False):
+    st.caption(
+        "Phân biệt rõ **số ngày có giao dịch** (`active_days`) với **số ngày lịch trong khoảng** (`calendar_days`). "
+        "Không kết luận mất dữ liệu chỉ dựa trên số ngày có giao dịch."
+    )
+    if coverage_df.attrs.get("db_error"):
+        st.error("❌ ERROR / UNAVAILABLE: Không thể tải bảng độ phủ theo rạp.")
+    elif not coverage_df.empty:
+        st.dataframe(coverage_df, use_container_width=True, hide_index=True)
 
 c1, c2, c3 = st.columns(3)
 with c1:
@@ -191,19 +211,36 @@ with c5:
         help_text="ticket_revenue_clean / ticket_qty_clean. Chỉ trên dữ liệu Clean.",
     )
 with c6:
-    anom_pct = anom_sum.get("anomaly_pct", 0) if anom_sum else 0
-    kpi_card(
-        title="Tỷ lệ suất bất thường",
-        value=anom_pct / 100 if anom_pct else 0,
-        kpi_key="anomaly_count",
-        unit="%",
-        help_text=(
-            f"Suất có giao dịch bất thường / Tổng suất = "
-            f"{anom_sum.get('anomaly_showtimes',0):,}/{anom_sum.get('total_showtimes',0):,}. "
-            "Nguồn: vw_anomaly_showtime."
-        ),
-        reverse_delta_color=True,
-    )
+    anom_status = anom_sum.get("status")
+    if anom_status == "ERROR":
+        kpi_card(
+            title="Tỷ lệ suất bất thường",
+            value="UNAVAILABLE",
+            kpi_key="anomaly_count",
+            help_text="Lỗi truy vấn vw_anomaly_showtime — không thay thế bằng 0.",
+        )
+    elif anom_status == "NO_DATA":
+        kpi_card(
+            title="Tỷ lệ suất bất thường",
+            value=None,
+            kpi_key="anomaly_count",
+            unit="%",
+            help_text="Không có suất chiếu trong khoảng lọc.",
+        )
+    else:
+        anom_pct = anom_sum.get("anomaly_pct", 0) or 0
+        kpi_card(
+            title="Tỷ lệ suất bất thường",
+            value=anom_pct / 100,
+            kpi_key="anomaly_count",
+            unit="%",
+            help_text=(
+                f"Suất có giao dịch bất thường / Tổng suất = "
+                f"{anom_sum.get('anomaly_showtimes', 0):,}/{anom_sum.get('total_showtimes', 0):,}. "
+                "Nguồn: vw_anomaly_showtime."
+            ),
+            reverse_delta_color=True,
+        )
 
 # ---------------------------------------------------------------------------
 # 8. ATTACH RATE & WEIGHTED OCCUPANCY (derived from views)
@@ -356,16 +393,18 @@ else:
 # 12. THỐNG KÊ DỮ LIỆU BẤT THƯỜNG
 # ---------------------------------------------------------------------------
 section_header("Thống Kê Dữ Liệu Bất Thường", icon="⚠️")
-if anom_sum:
+if anom_sum.get("status") == "ERROR":
+    st.error("❌ ERROR / UNAVAILABLE: Không thể truy vấn thống kê bất thường từ `vw_anomaly_showtime`.")
+elif anom_sum.get("status") == "OK":
     col_a1, col_a2, col_a3 = st.columns(3)
     with col_a1:
         st.metric("Tổng suất chiếu", f"{anom_sum.get('total_showtimes', 0):,}")
     with col_a2:
         st.metric("Suất có bất thường", f"{anom_sum.get('anomaly_showtimes', 0):,}")
     with col_a3:
-        st.metric("Tỷ lệ bất thường", f"{format_percent(anom_sum.get('anomaly_pct', 0)/100)}")
+        st.metric("Tỷ lệ bất thường", f"{format_percent((anom_sum.get('anomaly_pct', 0) or 0) / 100)}")
 
-    if anom_sum.get("anomaly_pct", 0) >= 30:
+    if (anom_sum.get("anomaly_pct") or 0) >= 30:
         notice(
             f"⚠️ Tỷ lệ suất bất thường {anom_sum['anomaly_pct']:.1f}% ≥ 30% — "
             "ngưỡng rule KPI-ANOM-HIGH. Cần kiểm toán dữ liệu giao dịch.",
@@ -378,7 +417,7 @@ if anom_sum:
         type="info",
     )
 else:
-    empty_state("Không có dữ liệu bất thường.")
+    empty_state("Không có dữ liệu suất chiếu bất thường trong khoảng đã chọn.")
 
 # ---------------------------------------------------------------------------
 # 13. F&B ATTACH RATE TREND

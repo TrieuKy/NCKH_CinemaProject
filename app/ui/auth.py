@@ -10,12 +10,18 @@ Quản lý xác thực và phân quyền người dùng (Authentication & Author
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Callable, Sequence
 import bcrypt
 import streamlit as st
 
+logger = logging.getLogger(__name__)
 SESSION_TIMEOUT_HOURS = 8
+VALID_CINEMA_KEYS = {1, 2, 3}
 
 
 # =============================================================================
@@ -69,9 +75,100 @@ def _default_db_fetch_user(username: str) -> dict[str, Any] | None:
                     "cinema_key": row[4],
                     "is_active": bool(row[5]),
                 }
-    except Exception as e:
-        st.error(f"Lỗi kết nối cơ sở dữ liệu xác thực: {e}")
+    except Exception:
+        logger.exception("Database error during user authentication")
+        st.error("Lỗi kết nối cơ sở dữ liệu xác thực. Vui lòng thử lại sau.")
     return None
+
+
+def is_demo_mode_enabled() -> bool:
+    """Chỉ bật demo khi biến môi trường CINEMA_DEMO_MODE=1."""
+    return os.environ.get("CINEMA_DEMO_MODE", "0").strip() == "1"
+
+
+def load_external_demo_users() -> dict[str, dict[str, Any]]:
+    """
+    Đọc danh sách tài khoản demo từ cấu hình bên ngoài repository:
+    - Biến môi trường CINEMA_DEMO_USERS_JSON (JSON dict), hoặc
+    - File ngoài repo qua CINEMA_DEMO_CONFIG_PATH.
+    Không lưu mật khẩu demo cố định trong source code.
+    """
+    if not is_demo_mode_enabled():
+        return {}
+
+    raw_json = os.environ.get("CINEMA_DEMO_USERS_JSON", "").strip()
+    if not raw_json:
+        cfg_path = os.environ.get("CINEMA_DEMO_CONFIG_PATH", "").strip()
+        if cfg_path:
+            p = Path(cfg_path)
+            if p.is_file():
+                try:
+                    raw_json = p.read_text(encoding="utf-8")
+                except Exception:
+                    logger.exception("Failed to read external demo config file")
+                    return {}
+
+    if not raw_json:
+        return {}
+
+    try:
+        data = json.loads(raw_json)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        logger.warning("Invalid external demo config JSON")
+    return {}
+
+
+def authenticate_demo_user(
+    username: str,
+    password: str,
+    fetch_user_fn: Callable[[str], dict[str, Any] | None] | None = None,
+) -> dict[str, Any] | None:
+    """
+    Xác thực tài khoản demo từ cấu hình bên ngoài khi CINEMA_DEMO_MODE=1.
+    - KHÔNG tự động thay thế khi tài khoản thật tồn tại trong DB nhưng sai mật khẩu.
+    - KHÔNG cho phép STAFF demo thiếu hoặc sai cinema_key.
+    """
+    if not is_demo_mode_enabled():
+        return None
+    u_clean = username.strip() if username else ""
+    if not u_clean or not password:
+        return None
+
+    # Nếu tài khoản tồn tại trong PostgreSQL thật, tuyệt đối không fallback sang demo
+    fetch_fn = fetch_user_fn or _default_db_fetch_user
+    if fetch_fn(u_clean) is not None:
+        return None
+
+    demo_users = load_external_demo_users()
+    rec = demo_users.get(u_clean)
+    if not isinstance(rec, dict):
+        return None
+
+    pw_hash = rec.get("password_hash")
+    plain_pw = rec.get("password")
+    ok = False
+    if pw_hash:
+        ok = verify_password(password, str(pw_hash))
+    elif plain_pw is not None:
+        ok = str(plain_pw) == password
+    if not ok:
+        return None
+
+    role = str(rec.get("role", "STAFF")).upper()
+    cinema_key = rec.get("cinema_key")
+    if role == "STAFF" and cinema_key not in VALID_CINEMA_KEYS:
+        return None
+
+    return {
+        "user_id": str(rec.get("user_id", f"demo-{u_clean}")),
+        "username": u_clean,
+        "role": role,
+        "cinema_key": cinema_key if role == "STAFF" else None,
+        "is_demo": True,
+        "login_time": datetime.now(),
+    }
 
 
 def authenticate_user(
@@ -132,17 +229,37 @@ def init_session_state() -> None:
         st.session_state.login_time = None
 
 
+SENSITIVE_SESSION_KEYS = (
+    "dss_decisions",
+    "dss_config",
+    "dss_error",
+    "dss_owner",
+)
+
+
+def clear_sensitive_session_state() -> None:
+    """Xóa state nghiệp vụ nhạy cảm khi đăng xuất hoặc chuyển phiên đăng nhập."""
+    for key in SENSITIVE_SESSION_KEYS:
+        if key in st.session_state:
+            del st.session_state[key]
+    for key in list(st.session_state.keys()):
+        if isinstance(key, str) and key.startswith(("dss_", "rev_", "kpi_", "fc_")):
+            del st.session_state[key]
+
+
 def login_user(user: dict[str, Any]) -> None:
-    """Thiết lập trạng thái đăng nhập cho phiên hiện tại."""
+    """Thiết lập trạng thái đăng nhập cho phiên hiện tại (clear state phiên cũ)."""
     init_session_state()
+    clear_sensitive_session_state()
     st.session_state.logged_in = True
     st.session_state.user = user
     st.session_state.login_time = user.get("login_time") or datetime.now()
 
 
 def logout_user() -> None:
-    """Xóa bỏ thông tin phiên và đưa về trạng thái chưa đăng nhập."""
+    """Xóa bỏ thông tin phiên và state nhạy cảm, đưa về trạng thái chưa đăng nhập."""
     init_session_state()
+    clear_sensitive_session_state()
     st.session_state.logged_in = False
     st.session_state.user = None
     st.session_state.login_time = None

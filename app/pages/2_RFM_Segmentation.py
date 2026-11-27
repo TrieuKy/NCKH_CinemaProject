@@ -31,7 +31,7 @@ from app.ui.components import (
 from app.ui.charts import apply_chart_theme
 from app.ui.format import format_currency, format_decimal, format_percent, format_date
 from app.data_access import (
-    load_rfm_cluster_profile, load_rfm_distribution, load_rfm_model_metrics, load_rfm_as_of_date
+    load_rfm_cluster_profile, load_rfm_distribution, load_rfm_model_metrics, load_rfm_dates
 )
 
 # ---------------------------------------------------------------------------
@@ -58,20 +58,29 @@ with st.spinner("Đang tải dữ liệu RFM từ PostgreSQL..."):
     profile_df  = load_rfm_cluster_profile()
     dist_df     = load_rfm_distribution()
     metrics_df  = load_rfm_model_metrics()
-    as_of       = load_rfm_as_of_date()
+    rfm_dates   = load_rfm_dates()
 
-# Cảnh báo data freshness
-if as_of:
+calc_date = rfm_dates.get("calculated_at")
+last_txn_date = rfm_dates.get("last_member_txn_date")
+
+# Cảnh báo data freshness — phân biệt rõ calculated_at vs ngày giao dịch hội viên cuối cùng
+if last_txn_date or calc_date:
     today = date.today()
-    age_days = (today - as_of).days
+    ref_freshness = last_txn_date or calc_date
+    age_days = (today - ref_freshness).days
+    date_detail = (
+        f"• Ngày giao dịch hội viên cuối cùng: **{format_date(last_txn_date) if last_txn_date else 'N/A'}**\n"
+        f"• Ngày chạy mô hình (`calculated_at`): **{format_date(calc_date) if calc_date else 'N/A'}**"
+    )
     if age_days > 30:
         notice(
-            f"⚠️ Dữ liệu RFM đã **{age_days} ngày** kể từ lần phân tích cuối ({format_date(as_of)}). "
-            "Kết quả phân khúc có thể không phản ánh hành vi khách hàng hiện tại.",
+            f"⚠️ Dữ liệu giao dịch hội viên đã **{age_days} ngày** kể từ giao dịch cuối cùng.\n\n"
+            f"{date_detail}\n\n"
+            "Không dùng ngày chạy mô hình mới để coi dữ liệu giao dịch là mới.",
             type="warning",
         )
     else:
-        notice(f"📅 Dữ liệu RFM tính đến ngày: **{format_date(as_of)}**", type="info")
+        notice(date_detail, type="info")
 else:
     notice("📅 Không xác định được ngày nguồn RFM — không có dữ liệu trong rfm_result.", type="warning")
 
@@ -85,6 +94,10 @@ notice(
     "Dashboard hiển thị kết quả k=3 thực tế.",
     type="warning",
 )
+
+if dist_df.attrs.get("db_error") or profile_df.attrs.get("db_error"):
+    st.error("❌ ERROR / UNAVAILABLE: Không thể tải dữ liệu RFM từ PostgreSQL.")
+    st.stop()
 
 # Empty check
 if dist_df.empty and profile_df.empty:

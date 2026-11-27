@@ -37,6 +37,7 @@ from app.ui.format import format_date, format_decimal
 from app.data_access import (
     load_forecast_results, load_forecast_model_metrics,
     load_historical_tickets, load_data_date_range, CINEMA_MAP,
+    analyze_forecast_status, prepare_backtest_comparison,
 )
 
 # ---------------------------------------------------------------------------
@@ -58,25 +59,45 @@ section_header(
 
 
 # ---------------------------------------------------------------------------
-# HELPER: Vẽ forecast chart
+# HELPER: Vẽ forecast chart (tách theo model_name để không cộng trùng mô hình)
 # ---------------------------------------------------------------------------
 def _plot_forecast(df: pd.DataFrame, label: str = "Forecast") -> None:
-    """Vẽ biểu đồ forecast yhat, yhat_lower, yhat_upper theo ngày × rạp."""
+    """Vẽ biểu đồ forecast yhat, yhat_lower, yhat_upper theo ngày × rạp × mô hình."""
     if df.empty:
         empty_state("Không có dữ liệu để hiển thị.")
         return
 
-    group_col = "cinema_key" if "cinema_key" in df.columns else None
-    groups = df.groupby(group_col) if group_col else [(None, df)]
+    # Kiểm tra trùng grain trước khi tổng hợp
+    grain_cols = [
+        c for c in ["target_date", "cinema_key", "time_slot", "model_name", "is_test", "metric_type"]
+        if c in df.columns
+    ]
+    if grain_cols and df.duplicated(subset=grain_cols).any():
+        st.error("❌ Phát hiện bản ghi trùng tại grain forecast. Không thể tổng hợp để vẽ biểu đồ.")
+        return
 
-    for ck, grp in groups:
-        cname = grp["cinema_name"].iloc[0] if "cinema_name" in grp.columns else f"Rạp {ck}"
+    group_cols = [c for c in ["cinema_key", "model_name"] if c in df.columns]
+    groups = df.groupby(group_cols) if group_cols else [(None, df)]
+
+    for keys, grp in groups:
+        cname = grp["cinema_name"].iloc[0] if "cinema_name" in grp.columns else "Tất cả rạp"
+        mname = grp["model_name"].iloc[0] if "model_name" in grp.columns else "model"
+        # Tổng hợp theo ngày trong cùng (cinema, model_name) qua các time_slot
+        daily_grp = (
+            grp.groupby("target_date", as_index=False)
+            .agg(
+                yhat=("yhat", "sum"),
+                yhat_lower=("yhat_lower", "sum"),
+                yhat_upper=("yhat_upper", "sum"),
+            )
+            .sort_values("target_date")
+        )
         fig = go.Figure()
 
         # Confidence band first (behind)
-        if "yhat_lower" in grp.columns and "yhat_upper" in grp.columns:
-            x_band = list(grp["target_date"]) + list(reversed(grp["target_date"].tolist()))
-            y_band = list(grp["yhat_upper"]) + list(reversed(grp["yhat_lower"].tolist()))
+        if "yhat_lower" in daily_grp.columns and "yhat_upper" in daily_grp.columns:
+            x_band = list(daily_grp["target_date"]) + list(reversed(daily_grp["target_date"].tolist()))
+            y_band = list(daily_grp["yhat_upper"]) + list(reversed(daily_grp["yhat_lower"].tolist()))
             fig.add_trace(go.Scatter(
                 x=x_band, y=y_band,
                 fill="toself", fillcolor="rgba(59,130,246,0.15)",
@@ -86,20 +107,20 @@ def _plot_forecast(df: pd.DataFrame, label: str = "Forecast") -> None:
             ))
 
         fig.add_trace(go.Scatter(
-            x=grp["target_date"], y=grp["yhat"],
-            name=f"yhat — {cname}", mode="lines+markers",
+            x=daily_grp["target_date"], y=daily_grp["yhat"],
+            name=f"yhat ({mname}) — {cname}", mode="lines+markers",
             line=dict(color=COLOR_PRIMARY),
             hovertemplate="%{x|%d/%m/%Y}<br>yhat: %{y:.0f} vé<extra></extra>",
         ))
 
-        apply_chart_theme(fig, title=f"{label} — {cname}", height=350,
+        apply_chart_theme(fig, title=f"{label} — {cname} ({mname})", height=350,
                           x_title="Ngày dự báo", y_title="Số vé dự báo (yhat)")
         st.plotly_chart(fig, use_container_width=True)
 
     # Data table
     display_cols = [c for c in [
-        "target_date", "cinema_name", "time_slot",
-        "yhat", "yhat_lower", "yhat_upper", "model_name"
+        "target_date", "cinema_name", "time_slot", "model_name",
+        "metric_type", "is_test", "yhat", "yhat_lower", "yhat_upper", "trained_date"
     ] if c in df.columns]
     data_table(df[display_cols].head(200), download_name=f"forecast_{label}.csv",
                key=f"fc_tbl_{label[:10]}")
@@ -124,54 +145,67 @@ with st.spinner("Đang tải dữ liệu forecast từ PostgreSQL..."):
     metrics_df  = load_forecast_model_metrics()
     min_dt, max_dt = load_data_date_range()
 
-today_ref = date.today()  # 2026-11-27 theo context
+if fc_df.attrs.get("db_error"):
+    st.error("❌ ERROR / UNAVAILABLE: Không thể tải dữ liệu dự báo từ PostgreSQL.")
+    st.stop()
+
+today_ref = date.today()
 
 # ---------------------------------------------------------------------------
-# PHÂN TÍCH TRẠNG THÁI FORECAST
+# PHÂN TÍCH TRẠNG THÁI FORECAST (CHUẨN HÓA KHOA HỌC)
 # ---------------------------------------------------------------------------
-fc_status = "NO_DATA"
-max_target_date = None
-min_target_date = None
-future_days_count = 0
-
-if not fc_df.empty:
-    target_dates = fc_df["target_date"].apply(
-        lambda x: x.date() if isinstance(x, pd.Timestamp) else x
-    )
-    max_target_date = target_dates.max()
-    min_target_date = target_dates.min()
-    future_days_count = int((target_dates > today_ref).sum())
-
-    if future_days_count >= 14:
-        fc_status = "VALID"
-    elif future_days_count > 0:
-        fc_status = "PARTIAL"
-    else:
-        fc_status = "EXPIRED"
+fc_meta = analyze_forecast_status(
+    fc_df,
+    reference_date=today_ref,
+    last_observed_date=max_dt,
+    horizon_days=14,
+)
+fc_status = fc_meta["status"]
+max_target_date = fc_meta["max_target_date"]
+min_target_date = fc_meta["min_target_date"]
+future_days_count = fc_meta["future_unique_days"]
 
 # ---------------------------------------------------------------------------
-# HIỂN THỊ TRẠNG THÁI
+# HIỂN THỊ TRẠNG THÁI & DATA FRESHNESS
 # ---------------------------------------------------------------------------
-section_header("Trạng Thái Dự Báo", icon="🔍")
+section_header("Trạng Thái Dự Báo & Data Freshness", icon="🔍")
+
+freshness_msg = (
+    f"• Ngày tham chiếu hiện tại: **{format_date(today_ref)}**\n"
+    f"• Ngày chạy mô hình (`trained_at`): **{format_date(fc_meta['trained_date']) if fc_meta['trained_date'] else 'N/A'}**\n"
+    f"• Ngày cuối dữ liệu quan sát: **{format_date(fc_meta['last_observed_date']) if fc_meta['last_observed_date'] else 'N/A'}**"
+)
 
 if fc_status == "VALID":
     notice(
-        f"✅ **FORECAST HỢP LỆ** — Có {future_days_count} ngày dự báo từ hôm nay ({format_date(today_ref)}) trở đi.",
+        f"✅ **FORECAST HỢP LỆ** — Có {future_days_count}/14 ngày duy nhất trong horizon "
+        f"({format_date(today_ref)} → {format_date(fc_meta['horizon_end'])}).\n\n{freshness_msg}",
         type="success",
+    )
+elif fc_status == "STALE_SOURCE":
+    notice(
+        f"⚠️ **STALE SOURCE — DỮ LIỆU NGUỒN QUÁ CŨ** — Dù có {future_days_count} ngày target tương lai, "
+        f"dữ liệu quan sát cuối cùng ({format_date(fc_meta['last_observed_date'])}) đã quá cũ "
+        f"({fc_meta['source_age_days']} ngày). **Không dùng làm khuyến nghị vận hành hiện hành.**\n\n{freshness_msg}",
+        type="danger",
     )
 elif fc_status == "PARTIAL":
     notice(
-        f"⚠️ **FORECAST KHÔNG ĐẦY ĐỦ (PARTIAL)** — Chỉ có {future_days_count}/14 ngày dự báo hợp lệ. "
-        f"Forecast đến {format_date(max_target_date)} — một phần đã qua hạn.",
+        f"⚠️ **FORECAST KHÔNG ĐẦY ĐỦ (PARTIAL)** — Chỉ có {future_days_count}/14 ngày duy nhất trong horizon 14 ngày.\n\n{freshness_msg}",
         type="warning",
+    )
+elif fc_status == "NO_FUTURE_FORECAST":
+    notice(
+        f"❌ **FC-DATA-GAP — CHỈ CÓ TEST PREDICTIONS (`is_test=True`)** — Không có bản ghi future forecast (`is_test=False`).\n\n{freshness_msg}",
+        type="danger",
     )
 elif fc_status == "EXPIRED":
     notice(
         f"❌ **FC-DATA-GAP — FORECAST ĐÃ HẾT HẠN (EXPIRED / HISTORICAL)**\n\n"
-        f"Dữ liệu forecast hiện có target_date từ **{format_date(min_target_date)}** "
-        f"đến **{format_date(max_target_date)}**. "
-        f"Tất cả các ngày này đã qua tại ngày tham chiếu {format_date(today_ref)}. "
-        "Dữ liệu này **không phải dự báo 14 ngày sắp tới** — xem trong khu vực Phân tích lịch sử bên dưới.",
+        f"Dữ liệu future forecast (`is_test=False`) có target_date từ "
+        f"**{format_date(fc_meta['future_min_date']) if fc_meta['future_min_date'] else 'N/A'}** "
+        f"đến **{format_date(fc_meta['future_max_date']) if fc_meta['future_max_date'] else 'N/A'}**. "
+        f"Tất cả các ngày này đã qua tại ngày tham chiếu {format_date(today_ref)}.\n\n{freshness_msg}",
         type="danger",
     )
 elif fc_status == "NO_DATA":
@@ -181,13 +215,15 @@ elif fc_status == "NO_DATA":
         type="danger",
     )
 
-col_s1, col_s2, col_s3 = st.columns(3)
+col_s1, col_s2, col_s3, col_s4 = st.columns(4)
 with col_s1:
     kpi_card(title="Trạng thái Forecast", value=fc_status)
 with col_s2:
-    kpi_card(title="Ngày target cuối cùng", value=format_date(max_target_date) if max_target_date else "N/A")
+    kpi_card(title="Ngày target cuối (prod)", value=format_date(fc_meta["future_max_date"]) if fc_meta["future_max_date"] else "N/A")
 with col_s3:
-    kpi_card(title="Ngày dự báo tương lai", value=future_days_count, unit="ngày")
+    kpi_card(title="Ngày tương lai trong horizon", value=future_days_count, unit="ngày")
+with col_s4:
+    kpi_card(title="Dữ liệu quan sát cuối", value=format_date(fc_meta["last_observed_date"]) if fc_meta["last_observed_date"] else "N/A")
 
 # ---------------------------------------------------------------------------
 # MODEL METRICS
@@ -205,69 +241,85 @@ else:
     empty_state("Không có model metrics. Chạy pipeline forecast để lưu kết quả đánh giá.")
 
 # ---------------------------------------------------------------------------
-# KHU VỰC FORECAST HỢP LỆ
+# KHU VỰC FORECAST HỢP LỆ (CHỈ is_test=False TRONG HORIZON 14 NGÀY)
 # ---------------------------------------------------------------------------
-if fc_status in ("VALID", "PARTIAL") and not fc_df.empty:
+if fc_meta["is_operational_ready"] and not fc_df.empty:
     section_header("📅 Dự Báo Hiện Hành (Hợp Lệ)", icon="✅")
     target_col = fc_df["target_date"].apply(lambda x: x.date() if isinstance(x, pd.Timestamp) else x)
-    valid_fc = fc_df[target_col > today_ref].sort_values("target_date")
+    valid_fc = fc_df[
+        (~fc_df["is_test"])
+        & (target_col > today_ref)
+        & (target_col <= fc_meta["horizon_end"])
+    ].sort_values("target_date")
     _plot_forecast(valid_fc, label="Forecast hiện hành")
 
 # ---------------------------------------------------------------------------
-# KHU VỰC LỊCH SỬ / AUDIT
+# KHU VỰC LỊCH SỬ / AUDIT (TÁCH RÕ TEST PREDICTIONS VS EXPIRED FUTURE FORECASTS)
 # ---------------------------------------------------------------------------
 st.markdown("---")
 section_header(
-    "📂 Phân Tích Lịch Sử [HISTORICAL / AUDIT]",
+    "📂 Phân Tích Lịch Sử & Hậu Kiểm [HISTORICAL / AUDIT]",
     subtitle=(
-        "⚠️ Dữ liệu này có target_date trong quá khứ — chỉ dùng để hậu kiểm (backtesting)."
+        "⚠️ Tách biệt Test Predictions (is_test=True) và Expired Future Forecasts (is_test=False). "
+        "Không cộng dự báo của nhiều mô hình khác nhau."
     ),
     icon="📂",
 )
 
 if not fc_df.empty:
-    notice(
-        "🔴 **TRẠNG THÁI: HISTORICAL** — Dữ liệu forecast bên dưới dùng để phân tích hậu kiểm, "
-        "không phải kế hoạch vận hành hiện tại.",
-        type="warning",
+    pred_type = st.radio(
+        "Loại bản ghi hiển thị:",
+        ["Future/Expired Forecasts (is_test=False)", "Test Predictions (is_test=True)"],
+        horizontal=True,
+        key="fc_hist_type",
     )
-    _plot_forecast(fc_df.sort_values("target_date"), label="Lịch sử forecast [HISTORICAL]")
+    want_test = "is_test=True" in pred_type
+    hist_fc_df = fc_df[fc_df["is_test"] == want_test].sort_values("target_date")
 
-    # So sánh với thực tế
-    with st.expander("📊 So sánh Forecast vs. Thực tế (hậu kiểm)", expanded=False):
-        if min_target_date and max_target_date:
-            actual_df = load_historical_tickets(fc_cinema_key, min_target_date, max_target_date)
-            if not actual_df.empty:
-                fc_agg = fc_df.groupby("target_date").agg(yhat_total=("yhat", "sum")).reset_index()
-                fc_agg["target_date"] = pd.to_datetime(fc_agg["target_date"])
-                act_agg = actual_df.groupby("full_date").agg(
-                    actual_total=("ticket_qty_clean", "sum")
-                ).reset_index()
-                act_agg["full_date"] = pd.to_datetime(act_agg["full_date"])
-                merged = pd.merge(
-                    fc_agg.rename(columns={"target_date": "date"}),
-                    act_agg.rename(columns={"full_date": "date"}),
-                    on="date", how="outer"
-                ).sort_values("date")
+    if hist_fc_df.empty:
+        empty_state("Không có bản ghi thuộc loại đã chọn.")
+    else:
+        _plot_forecast(hist_fc_df, label="Test_Predictions" if want_test else "Expired_Forecasts")
 
-                fig_cmp = go.Figure()
-                fig_cmp.add_trace(go.Scatter(
-                    x=merged["date"], y=merged["actual_total"],
-                    name="Thực tế (ticket_qty_clean)", mode="lines+markers",
-                    line=dict(color="#10B981"),
-                ))
-                fig_cmp.add_trace(go.Scatter(
-                    x=merged["date"], y=merged["yhat_total"],
-                    name="Dự báo (yhat tổng hợp)", mode="lines", line=dict(dash="dash"),
-                ))
-                apply_chart_theme(fig_cmp, title="Thực tế vs. Dự báo — Hậu kiểm",
-                                  height=350, x_title="Ngày", y_title="Số vé")
-                st.plotly_chart(fig_cmp, use_container_width=True)
-                st.caption("⚠️ So sánh hậu kiểm — không phải dự báo tương lai.")
-            else:
-                empty_state("Không có dữ liệu giao dịch thực tế trong khoảng forecast để so sánh.")
-        else:
-            empty_state("Không đủ thông tin để tải dữ liệu thực tế.")
+        # So sánh với thực tế — bắt buộc tách theo model_name
+        with st.expander("📊 So sánh Forecast vs. Thực tế (hậu kiểm theo mô hình)", expanded=False):
+            avail_models = sorted(hist_fc_df["model_name"].dropna().unique().tolist()) if "model_name" in hist_fc_df.columns else []
+            model_choices = ["Tất cả mô hình (vẽ riêng từng mô hình)"] + avail_models
+            sel_model_opt = st.selectbox("Chọn mô hình hậu kiểm:", model_choices, key="fc_backtest_model")
+            sel_model = None if sel_model_opt.startswith("Tất cả") else sel_model_opt
+
+            h_min = hist_fc_df["target_date"].min()
+            h_max = hist_fc_df["target_date"].max()
+            if h_min and h_max:
+                actual_df = load_historical_tickets(fc_cinema_key, h_min, h_max)
+                if actual_df.attrs.get("db_error"):
+                    st.error("❌ ERROR / UNAVAILABLE: Không thể tải dữ liệu vé thực tế.")
+                elif not actual_df.empty:
+                    merged, err_msg = prepare_backtest_comparison(
+                        hist_fc_df, actual_df, selected_model=sel_model, metric_type="tickets"
+                    )
+                    if err_msg:
+                        st.warning(f"⚠️ {err_msg}")
+                    elif not merged.empty:
+                        fig_cmp = go.Figure()
+                        act_line = merged[["date", "actual_total"]].drop_duplicates().sort_values("date")
+                        fig_cmp.add_trace(go.Scatter(
+                            x=act_line["date"], y=act_line["actual_total"],
+                            name="Thực tế (ticket_qty_clean)", mode="lines+markers",
+                            line=dict(color="#10B981", width=2.5),
+                        ))
+                        for m_name, m_grp in merged.groupby("model_name"):
+                            m_grp = m_grp.sort_values("date")
+                            fig_cmp.add_trace(go.Scatter(
+                                x=m_grp["date"], y=m_grp["yhat_total"],
+                                name=f"Dự báo ({m_name})", mode="lines", line=dict(dash="dash"),
+                            ))
+                        apply_chart_theme(fig_cmp, title="Thực tế vs. Dự báo — Hậu kiểm theo từng mô hình",
+                                          height=350, x_title="Ngày", y_title="Số vé (tickets)")
+                        st.plotly_chart(fig_cmp, use_container_width=True)
+                        st.caption("⚠️ So sánh hậu kiểm — không cộng trùng nhiều mô hình, không phải dự báo tương lai.")
+                else:
+                    empty_state("Không có dữ liệu giao dịch thực tế trong khoảng forecast để so sánh.")
 else:
     empty_state(
         "Không có dữ liệu forecast trong database. Vui lòng chạy pipeline forecast.",
