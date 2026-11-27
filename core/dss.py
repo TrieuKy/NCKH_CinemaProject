@@ -371,6 +371,7 @@ def evaluate_kpi_rules(
     """
     cfg = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
     decisions: List[Decision] = []
+    ref_date = reference_date or date.today()
 
     if daily_kpi_df is None or daily_kpi_df.empty:
         return decisions
@@ -378,11 +379,12 @@ def evaluate_kpi_rules(
     df = daily_kpi_df.copy()
     df["full_date"] = pd.to_datetime(df["full_date"], errors="coerce")
     df = df.dropna(subset=["full_date", "cinema_key"])
+    if mode == "historical_audit":
+        df = df[df["full_date"] <= pd.Timestamp(ref_date)]
     if df.empty:
         return decisions
 
     max_date = df["full_date"].max().date()
-    ref_date = reference_date or max_date
 
     curr_start = pd.Timestamp(max_date) - pd.Timedelta(days=6)
     prev_start = curr_start - pd.Timedelta(days=7)
@@ -397,6 +399,17 @@ def evaluate_kpi_rules(
         if not check["is_valid"]:
             # Nếu hoàn toàn không có dữ liệu ở một kỳ (0 ngày) hoặc thiếu ngày / trùng ngày / NULL -> cảnh báo kiểm toán
             if check["days_current"] > 0 or check["days_previous"] > 0:
+                gap_title = f"[{cinema_name}] Dữ liệu KPI doanh thu 7 ngày không đủ điều kiện so sánh ({','.join(check['reasons'])})"
+                eff_sev, eff_title, freshness, stale_notes = _apply_freshness_policy(
+                    "MEDIUM",
+                    gap_title,
+                    max_date.isoformat(),
+                    ref_date,
+                    cfg["max_stale_days"],
+                    "KPI (vw_daily_kpi)",
+                    mode=mode,
+                    is_actionable=False,
+                )
                 decisions.append(
                     Decision(
                         decision_id=make_decision_id("KPI-DATA-GAP", ck, time_scope, sub_key="rev_7d"),
@@ -404,10 +417,11 @@ def evaluate_kpi_rules(
                         cinema_key=ck,
                         time_scope=time_scope,
                         category="REVENUE_KPI",
-                        severity="MEDIUM",
-                        title=f"[{cinema_name}] Dữ liệu KPI doanh thu 7 ngày không đủ điều kiện so sánh ({','.join(check['reasons'])})",
+                        severity=eff_sev,
+                        title=eff_title,
                         recommendation="Kiểm tra dữ liệu nguồn fact_daily_cinema_summary / vw_daily_kpi trước khi kết luận biến động doanh thu.",
                         explanation={
+                            "decision_mode": freshness["decision_mode"],
                             "what_happened": (
                                 f"Cửa sổ so sánh 7 ngày tại {cinema_name} không hợp lệ: "
                                 f"kỳ hiện tại {check['days_current']}/7 ngày, kỳ trước {check['days_previous']}/7 ngày, "
@@ -430,12 +444,14 @@ def evaluate_kpi_rules(
                                 "missing_dates_previous": check["missing_dates_previous"],
                                 "duplicate_dates": check["duplicate_dates"],
                                 "null_rows": check["null_rows"],
+                                "freshness": freshness,
                             }
                         ],
                         source_model="kpi_dw",
                         as_of_date=max_date.isoformat(),
                         limitations=[
-                            "Không tự điền doanh thu thiếu bằng 0; bỏ qua KPI-REV-DROP để tránh cảnh báo sụt giảm giả."
+                            "Không tự điền doanh thu thiếu bằng 0; bỏ qua KPI-REV-DROP để tránh cảnh báo sụt giảm giả.",
+                            *stale_notes,
                         ],
                     )
                 )
@@ -517,6 +533,8 @@ def evaluate_kpi_rules(
         occ["full_date"] = pd.to_datetime(occ["full_date"], errors="coerce")
         occ = occ.dropna(subset=["full_date", "cinema_key", "qty_clean", "capacity"])
         occ = occ[occ["capacity"] > 0]
+        if mode == "historical_audit":
+            occ = occ[occ["full_date"] <= pd.Timestamp(ref_date)]
         if not occ.empty:
             occ_max = occ["full_date"].max().date()
             occ_start = pd.Timestamp(occ_max) - pd.Timedelta(days=6)
@@ -587,6 +605,8 @@ def evaluate_kpi_rules(
         fnb = fnb_attach_df.copy()
         fnb["full_date"] = pd.to_datetime(fnb["full_date"], errors="coerce")
         fnb = fnb.dropna(subset=["full_date", "cinema_key", "ticket_txn_count", "fnb_txn_count"])
+        if mode == "historical_audit":
+            fnb = fnb[fnb["full_date"] <= pd.Timestamp(ref_date)]
         if not fnb.empty:
             fnb_max = fnb["full_date"].max().date()
             fnb_curr_start = pd.Timestamp(fnb_max) - pd.Timedelta(days=6)
@@ -603,6 +623,16 @@ def evaluate_kpi_rules(
                 c_days = int(c_g["full_date"].dt.date.nunique())
                 p_days = int(p_g["full_date"].dt.date.nunique())
                 if c_days < 7:
+                    eff_sev, eff_title, freshness, stale_notes = _apply_freshness_policy(
+                        "MEDIUM",
+                        f"[{cinema_name}] Dữ liệu F&B attach_rate 7 ngày chưa đủ ({c_days}/7 ngày)",
+                        fnb_max.isoformat(),
+                        ref_date,
+                        cfg["max_stale_days"],
+                        "F&B Attach (vw_fnb_attach)",
+                        mode=mode,
+                        is_actionable=False,
+                    )
                     decisions.append(
                         Decision(
                             decision_id=make_decision_id("KPI-DATA-GAP", ck, fnb_scope, sub_key="fnb_7d"),
@@ -610,19 +640,20 @@ def evaluate_kpi_rules(
                             cinema_key=ck,
                             time_scope=fnb_scope,
                             category="REVENUE_KPI",
-                            severity="MEDIUM",
-                            title=f"[{cinema_name}] Dữ liệu F&B attach_rate 7 ngày chưa đủ ({c_days}/7 ngày)",
+                            severity=eff_sev,
+                            title=eff_title,
                             recommendation="Kiểm tra dữ liệu vw_fnb_attach trước khi đánh giá suy giảm bán kèm F&B.",
                             explanation={
+                                "decision_mode": freshness["decision_mode"],
                                 "what_happened": f"Cửa sổ hiện tại của F&B tại {cinema_name} chỉ có {c_days}/7 ngày lịch duy nhất.",
                                 "why_triggered": "Rule KPI-DATA-GAP kích hoạt khi cửa sổ F&B 7 ngày bị thiếu ngày.",
                                 "why_recommended": "Tránh kết luận sai về attach_rate trên cửa sổ thiếu ngày.",
                                 "manager_checks": ["Kiểm tra dữ liệu fact_fnb và fact_ticket theo ngày."],
                             },
-                            evidence=[{"metric": "fnb_window_completeness", "days_current": c_days, "days_previous": p_days}],
+                            evidence=[{"metric": "fnb_window_completeness", "days_current": c_days, "days_previous": p_days, "freshness": freshness}],
                             source_model="kpi_dw",
                             as_of_date=fnb_max.isoformat(),
-                            limitations=["Cửa sổ F&B hiện tại không đủ 7 ngày."],
+                            limitations=["Cửa sổ F&B hiện tại không đủ 7 ngày.", *stale_notes],
                         )
                     )
                     continue
@@ -706,6 +737,9 @@ def evaluate_kpi_rules(
     # Rule KPI-ANOM-HIGH: cảnh báo chất lượng dữ liệu nếu tỷ lệ suất bất thường cao
     if anomaly_df is not None and not anomaly_df.empty:
         anom = anomaly_df.copy()
+        if mode == "historical_audit" and "full_date" in anom.columns:
+            anom["full_date"] = pd.to_datetime(anom["full_date"], errors="coerce")
+            anom = anom[anom["full_date"] <= pd.Timestamp(ref_date)]
         anom = anom.dropna(subset=["cinema_key", "is_anomaly_showtime"])
         if not anom.empty:
             a_max = _to_iso_date(anom["full_date"].max()) if "full_date" in anom.columns else max_date.isoformat()
@@ -793,14 +827,26 @@ def evaluate_rfm_rules(
         return decisions
 
     prof = profile_df.copy()
+    ref_date = reference_date or date.today()
     actual_k = int(prof["cluster_id"].nunique()) if "cluster_id" in prof.columns else len(prof)
     model_run_date = as_of_date or (
-        _to_iso_date(prof["updated_at"].max()) if "updated_at" in prof.columns else date.today().isoformat()
+        _to_iso_date(prof["updated_at"].max()) if "updated_at" in prof.columns else ref_date.isoformat()
     )
     # Ngày dữ liệu thực tế: ưu tiên ngày giao dịch hội viên cuối cùng nếu có, để phát hiện dữ liệu gốc quá cũ
     effective_data_date = member_last_txn_date or model_run_date
-    ref_date = reference_date or date.today()
     time_scope = f"rfm_as_of_{model_run_date}"
+
+    audit_notes: List[str] = []
+    if mode == "historical_audit":
+        audit_notes.append(
+            "Bảng rfm_cluster_profile chỉ lưu snapshot hiện tại (không có lịch sử theo ngày); "
+            "không thể tái lập phân cụm tại thời điểm quá khứ và không phải kết quả historical backtest chống data leakage."
+        )
+        if model_run_date and model_run_date > ref_date.isoformat():
+            audit_notes.append(
+                f"CẢNH BÁO LOOK-AHEAD LEAKAGE: Mô hình RFM được cập nhật lúc {model_run_date} "
+                f"(sau reference_date={ref_date.isoformat()}); kết quả này chưa tồn tại tại thời điểm replay."
+            )
 
     # Rule RFM-K-MISMATCH: cảnh báo tích hợp mô hình (không phải khuyến nghị chiến dịch tức thời)
     if actual_k != cfg["rfm_expected_business_k"]:
@@ -853,6 +899,7 @@ def evaluate_rfm_rules(
                 as_of_date=model_run_date or "",
                 limitations=[
                     "Khách vãng lai (GUEST, ~70% giao dịch) không nằm trong mô hình RFM.",
+                    *audit_notes,
                     *stale_notes,
                 ],
             )
@@ -915,6 +962,7 @@ def evaluate_rfm_rules(
                     as_of_date=model_run_date or "",
                     limitations=[
                         "Chưa có thử nghiệm A/B thực tế nên không khẳng định chiến dịch chắc chắn làm tăng doanh thu.",
+                        *audit_notes,
                         *stale_notes,
                     ],
                 )
@@ -974,6 +1022,7 @@ def evaluate_rfm_rules(
                     as_of_date=model_run_date or "",
                     limitations=[
                         "Tác động tài chính của quyền lợi VIP cần được đo lường qua giữ chân dài hạn.",
+                        *audit_notes,
                         *stale_notes,
                     ],
                 )
@@ -1009,11 +1058,23 @@ def _build_scheduled_slot_capacity(schedule_df: Optional[pd.DataFrame]) -> Dict[
     return {(d, int(ck), str(slot)): float(cap) for (d, ck, slot), cap in grouped.items()}
 
 
-def _build_hist_slot_mean(hist_slot_df: Optional[pd.DataFrame]) -> Dict[Tuple[int, str], float]:
-    """Tính trung bình số vé sạch lịch sử theo (cinema_key, time_slot) để đánh giá Demand Surge tương đối."""
+def _build_hist_slot_mean(
+    hist_slot_df: Optional[pd.DataFrame],
+    max_date: Optional[date] = None,
+) -> Dict[Tuple[int, str], float]:
+    """
+    Tính trung bình số vé sạch lịch sử theo (cinema_key, time_slot) để đánh giá Demand Surge tương đối.
+    Nếu `max_date` được cung cấp và bảng có cột ngày (`full_date` hoặc `show_date`),
+    chỉ sử dụng quan sát `<= max_date` để chống look-ahead leakage.
+    """
     if hist_slot_df is None or hist_slot_df.empty:
         return {}
     hist = hist_slot_df.copy()
+    if max_date is not None:
+        date_col = "full_date" if "full_date" in hist.columns else ("show_date" if "show_date" in hist.columns else None)
+        if date_col is not None:
+            hist["_hdate"] = pd.to_datetime(hist[date_col], errors="coerce").dt.date
+            hist = hist[hist["_hdate"].notna() & (hist["_hdate"] <= max_date)]
     val_col = "hist_slot_mean" if "hist_slot_mean" in hist.columns else "qty_clean"
     if val_col not in hist.columns or "cinema_key" not in hist.columns or "time_slot" not in hist.columns:
         return {}
@@ -1099,27 +1160,88 @@ def evaluate_forecast_rules(
 
     df["_tdate"] = df["target_date"].dt.date
     created_at_str = _to_iso_date(df["created_at"].max()) if "created_at" in df.columns else None
+    horizon_start = ref_date + timedelta(days=1)
+    horizon_end = ref_date + timedelta(days=horizon_days)
 
     if mode == "operational":
-        valid_df = df[df["_tdate"] > ref_date].copy()
-        expired_df = df[df["_tdate"] <= ref_date].copy()
+        valid_df = df[(df["_tdate"] >= horizon_start) & (df["_tdate"] <= horizon_end)].copy()
+        expired_df = df[df["_tdate"] < horizon_start].copy()
+        beyond_horizon_df = df[df["_tdate"] > horizon_end].copy()
     else:
         valid_df = df.copy()
         expired_df = pd.DataFrame(columns=df.columns)
+        beyond_horizon_df = pd.DataFrame(columns=df.columns)
 
     sched_cap_map = _build_scheduled_slot_capacity(schedule_df)
-    hist_mean_map = _build_hist_slot_mean(hist_slot_df)
+    hist_mean_map = _build_hist_slot_mean(hist_slot_df, max_date=ref_date)
+
+    obs_stale_days = _is_stale(observed_last_date, ref_date, cfg["max_stale_days"]) if observed_last_date else None
+    obs_missing = not observed_last_date
+    obs_unusable_in_op = (mode == "operational") and (obs_missing or (obs_stale_days is not None))
+
+    audit_notes: List[str] = []
+    lookahead_risk = False
+    if mode == "historical_audit":
+        created_after_ref = bool(created_at_str and created_at_str > ref_date.isoformat())
+        observed_after_ref = bool(observed_last_date and observed_last_date > ref_date.isoformat())
+        lookahead_risk = created_after_ref or observed_after_ref
+        audit_notes.append(
+            "Chế độ HISTORICAL_AUDIT chỉ phục vụ kiểm toán hậu kiểm; không phải kết quả scientific backtesting chính thức đã kiểm định chống data leakage."
+        )
+        if lookahead_risk:
+            audit_notes.append(
+                f"CẢNH BÁO LOOK-AHEAD LEAKAGE: created_at={created_at_str}, observed_last_date={observed_last_date} "
+                f"có mốc sau reference_date={ref_date.isoformat()}; kết quả không phản ánh thông tin sẵn có tại thời điểm replay."
+            )
 
     all_cks = sorted(set(expected_cinema_keys or []) | set(df["cinema_key"].astype(int).unique()))
     for ck in all_cks:
         cinema_name = name_map.get(ck, f"CN{ck:02d}")
         ck_valid = valid_df[valid_df["cinema_key"] == ck]
         ck_expired = expired_df[expired_df["cinema_key"] == ck]
+        ck_beyond = beyond_horizon_df[beyond_horizon_df["cinema_key"] == ck]
 
         if mode == "operational" and ck_valid.empty:
-            reason = "all_forecasts_expired" if not ck_expired.empty else "missing_cinema_forecast"
+            if not ck_expired.empty and ck_beyond.empty:
+                reason = "all_forecasts_expired"
+            elif not ck_beyond.empty and ck_expired.empty:
+                reason = "all_forecasts_beyond_horizon"
+            elif not ck_expired.empty and not ck_beyond.empty:
+                reason = "no_forecasts_in_horizon"
+            else:
+                reason = "missing_cinema_forecast"
+
             exp_min = ck_expired["_tdate"].min().isoformat() if not ck_expired.empty else None
             exp_max = ck_expired["_tdate"].max().isoformat() if not ck_expired.empty else None
+            beyond_min = ck_beyond["_tdate"].min().isoformat() if not ck_beyond.empty else None
+            beyond_max = ck_beyond["_tdate"].max().isoformat() if not ck_beyond.empty else None
+
+            if reason == "all_forecasts_expired":
+                gap_title = f"[{cinema_name}] Toàn bộ dự báo đã hết hạn tại {ref_date.isoformat()} (target_date <= reference_date)"
+                gap_what = (
+                    f"Tìm thấy {len(ck_expired)} dòng dự báo cho {cinema_name} ({exp_min}..{exp_max}, created_at={created_at_str}), "
+                    f"nhưng toàn bộ có target_date <= reference_date ({ref_date.isoformat()}) nên không còn hiệu lực vận hành."
+                )
+                gap_why = f"Rule FC-DATA-GAP kích hoạt ({reason}); không dùng created_at mới để coi target_date quá khứ là còn hiệu lực."
+            elif reason == "all_forecasts_beyond_horizon":
+                gap_title = f"[{cinema_name}] Dự báo chỉ nằm ngoài horizon 14 ngày ({horizon_scope})"
+                gap_what = (
+                    f"Tìm thấy {len(ck_beyond)} dòng dự báo cho {cinema_name} ({beyond_min}..{beyond_max}), "
+                    f"nhưng toàn bộ nằm ngoài horizon 14 ngày ({horizon_scope}) và thiếu hoàn toàn ngày trong horizon."
+                )
+                gap_why = f"Rule FC-DATA-GAP kích hoạt ({reason}); dự báo từ ngày thứ 15 trở đi không được dùng cho horizon 14 ngày."
+            elif reason == "no_forecasts_in_horizon":
+                gap_title = f"[{cinema_name}] Không có dự báo hợp lệ trong horizon 14 ngày ({horizon_scope})"
+                gap_what = (
+                    f"Rạp {cinema_name} có {len(ck_expired)} dòng quá hạn và {len(ck_beyond)} dòng ngoài horizon 14 ngày, "
+                    f"nhưng 0 dòng trong cửa sổ {horizon_scope}."
+                )
+                gap_why = f"Rule FC-DATA-GAP kích hoạt ({reason}); không dùng dữ liệu ngoài horizon để lấp chỗ trống."
+            else:
+                gap_title = f"[{cinema_name}] Thiếu dữ liệu dự báo 14 ngày"
+                gap_what = f"Không có bản ghi dự báo hợp lệ cho rạp cinema_key={ck} trong horizon {horizon_scope}."
+                gap_why = f"Rule FC-DATA-GAP kích hoạt ({reason})."
+
             decisions.append(
                 Decision(
                     decision_id=make_decision_id("FC-DATA-GAP", ck, horizon_scope, sub_key=reason),
@@ -1128,22 +1250,13 @@ def evaluate_forecast_rules(
                     time_scope=horizon_scope,
                     category="CAPACITY_FORECAST",
                     severity="MEDIUM",
-                    title=(
-                        f"[{cinema_name}] Toàn bộ dự báo đã hết hạn tại {ref_date.isoformat()} (target_date <= reference_date)"
-                        if reason == "all_forecasts_expired"
-                        else f"[{cinema_name}] Thiếu dữ liệu dự báo 14 ngày"
-                    ),
-                    recommendation="Cập nhật dữ liệu lịch sử mới nhất và chạy lại pipeline dự báo (scripts/run_forecast.py) cho horizon tương lai.",
+                    title=gap_title,
+                    recommendation="Cập nhật dữ liệu lịch sử mới nhất và chạy lại pipeline dự báo (scripts/run_forecast.py) cho horizon 14 ngày tới.",
                     explanation={
                         "decision_mode": "OPERATIONAL",
-                        "what_happened": (
-                            f"Tìm thấy {len(ck_expired)} dòng dự báo cho {cinema_name} ({exp_min}..{exp_max}, created_at={created_at_str}), "
-                            f"nhưng toàn bộ có target_date <= reference_date ({ref_date.isoformat()}) nên không còn hiệu lực vận hành."
-                            if reason == "all_forecasts_expired"
-                            else f"Không có bản ghi dự báo hợp lệ cho rạp cinema_key={ck} sau ngày {ref_date.isoformat()}."
-                        ),
-                        "why_triggered": f"Rule FC-DATA-GAP kích hoạt ({reason}); không dùng created_at mới để coi target_date quá khứ là còn hiệu lực.",
-                        "why_recommended": "Không được phát cảnh báo công suất hoặc khuyến nghị mở suất từ dự báo đã hết hạn.",
+                        "what_happened": gap_what,
+                        "why_triggered": gap_why,
+                        "why_recommended": "Không được phát cảnh báo công suất hoặc khuyến nghị mở suất từ dự báo đã hết hạn hoặc ngoài horizon.",
                         "manager_checks": [
                             "Kiểm tra ngày dữ liệu quan sát cuối cùng (fact_showtime_summary) và chạy lại dự báo cho 14 ngày tới."
                         ],
@@ -1155,15 +1268,18 @@ def evaluate_forecast_rules(
                             "future_rows": 0,
                             "expired_rows": int(len(ck_expired)),
                             "expired_target_range": f"{exp_min}..{exp_max}" if exp_min else None,
+                            "beyond_horizon_rows": int(len(ck_beyond)),
+                            "beyond_horizon_range": f"{beyond_min}..{beyond_max}" if beyond_min else None,
                             "model_created_at": created_at_str,
                             "observed_last_date": observed_last_date,
+                            "observed_stale_days": obs_stale_days,
                             "reference_date": ref_date.isoformat(),
                         }
                     ],
                     source_model="forecast",
-                    as_of_date=created_at_str or ref_date.isoformat(),
+                    as_of_date=observed_last_date or created_at_str or ref_date.isoformat(),
                     limitations=[
-                        "Dự báo cũ hơn ngày tham chiếu bị chặn khỏi chế độ vận hành; muốn xem lại chỉ sử dụng chế độ historical_audit."
+                        "Dự báo cũ hơn ngày tham chiếu hoặc ngoài horizon 14 ngày bị chặn khỏi chế độ vận hành; muốn xem lại chỉ sử dụng chế độ historical_audit."
                     ],
                 )
             )
@@ -1187,7 +1303,7 @@ def evaluate_forecast_rules(
                         explanation={
                             "decision_mode": "OPERATIONAL",
                             "what_happened": f"Rạp {cinema_name} chỉ có dự báo cho {len(covered_dates)}/{horizon_days} ngày trong cửa sổ {horizon_scope}.",
-                            "why_triggered": "Rule FC-DATA-GAP kích hoạt khi số ngày dự báo tương lai < 14 ngày (không mặc định 1 dòng là đủ 14 ngày).",
+                            "why_triggered": "Rule FC-DATA-GAP kích hoạt khi số ngày dự báo tương lai < 14 ngày (không dùng ngày thứ 15+ để lấp ngày thiếu).",
                             "why_recommended": "Thiếu ngày trong horizon có thể bỏ sót điểm cao điểm cục bộ.",
                             "manager_checks": ["Đối chiếu danh sách missing_dates trong evidence với lịch chạy scripts/run_forecast.py."],
                         },
@@ -1199,13 +1315,14 @@ def evaluate_forecast_rules(
                                 "expected_days": horizon_days,
                                 "missing_dates": missing_dates,
                                 "expired_rows_ignored": int(len(ck_expired)),
+                                "beyond_horizon_rows_ignored": int(len(ck_beyond)),
                                 "model_created_at": created_at_str,
                                 "observed_last_date": observed_last_date,
                                 "reference_date": ref_date.isoformat(),
                             }
                         ],
                         source_model="forecast",
-                        as_of_date=created_at_str or ref_date.isoformat(),
+                        as_of_date=observed_last_date or created_at_str or ref_date.isoformat(),
                         limitations=[
                             "Ngày không có suất theo lịch chiếu không bị tính là lỗi, nhưng ngày thiếu hoàn toàn trong forecast_result là thiếu dữ liệu dự báo."
                         ],
@@ -1234,9 +1351,83 @@ def evaluate_forecast_rules(
                     if surge_ratio >= cfg["fc_spike_vs_hist_ratio"]:
                         demand_surge_rows.append((row, hist_mean, surge_ratio))
 
+        if obs_unusable_in_op:
+            blocked_rules = []
+            if cap_pressure_rows:
+                blocked_rules.append("FC-PEAK-DEMAND")
+            if demand_surge_rows:
+                blocked_rules.append("FC-DEMAND-SURGE")
+
+            gap_sub_key = "missing_observed_date" if obs_missing else "stale_observed_source"
+            gap_title = (
+                f"[{cinema_name}] Thiếu observed_last_date để xác minh độ mới dữ liệu nguồn dự báo"
+                if obs_missing
+                else f"[{cinema_name}] Dữ liệu quan sát nguồn dự báo đã quá hạn ({obs_stale_days} ngày)"
+            )
+            gap_what = (
+                f"Dự báo cho {cinema_name} có {len(ck_valid)} dòng trong horizon {horizon_scope} (created_at={created_at_str}), "
+                f"nhưng thiếu mốc observed_last_date nên không thể xác minh độ mới dữ liệu quan sát gốc."
+                if obs_missing
+                else f"Dự báo cho {cinema_name} (created_at={created_at_str}) được xây trên dữ liệu quan sát kết thúc ngày "
+                f"{observed_last_date} (cũ {obs_stale_days} ngày > ngưỡng {cfg['max_stale_days']} ngày tại {ref_date.isoformat()})."
+            )
+            decisions.append(
+                Decision(
+                    decision_id=make_decision_id("FC-DATA-GAP", ck, horizon_scope, sub_key=gap_sub_key),
+                    rule_id="FC-DATA-GAP",
+                    cinema_key=ck,
+                    time_scope=horizon_scope,
+                    category="CAPACITY_FORECAST",
+                    severity="MEDIUM",
+                    title=gap_title,
+                    recommendation="Cập nhật dữ liệu quan sát mới nhất vào fact_showtime_summary và chạy lại pipeline dự báo trước khi ra quyết định vận hành.",
+                    explanation={
+                        "decision_mode": "HISTORICAL_ANALYSIS_ONLY" if obs_stale_days is not None else "OPERATIONAL",
+                        "what_happened": gap_what,
+                        "why_triggered": "Rule FC-DATA-GAP kích hoạt để tách cảnh báo độ mới dữ liệu nguồn khỏi cảnh báo nhu cầu; không dùng created_at thay thế observed_last_date.",
+                        "why_recommended": "Chặn phát khuyến nghị Capacity Pressure / Demand Surge hiện hành khi dữ liệu quan sát gốc quá hạn hoặc chưa được xác minh.",
+                        "manager_checks": [
+                            "Kiểm tra MAX(full_date) trong fact_showtime_summary và nhật ký ETL.",
+                            "Chỉ mở khóa khuyến nghị dự báo sau khi dữ liệu quan sát được cập nhật và re-train/re-predict.",
+                        ],
+                    },
+                    evidence=[
+                        {
+                            "reason": gap_sub_key,
+                            "cinema_key": ck,
+                            "observed_last_date": observed_last_date,
+                            "observed_stale_days": obs_stale_days,
+                            "model_created_at": created_at_str,
+                            "reference_date": ref_date.isoformat(),
+                            "blocked_rules": blocked_rules,
+                            "blocked_cap_pressure_slots": len(cap_pressure_rows),
+                            "blocked_demand_surge_slots": len(demand_surge_rows),
+                        }
+                    ],
+                    source_model="forecast",
+                    as_of_date=observed_last_date or created_at_str or ref_date.isoformat(),
+                    limitations=[
+                        "Đã chặn FC-PEAK-DEMAND và FC-DEMAND-SURGE trong chế độ vận hành do dữ liệu quan sát nguồn quá hạn hoặc thiếu mốc kiểm chứng.",
+                    ],
+                )
+            )
+            continue
+
         date_min = ck_valid["_tdate"].min().isoformat()
         date_max = ck_valid["_tdate"].max().isoformat()
         scope = f"{date_min}..{date_max}"
+        freshness_source_date = observed_last_date or created_at_str or ref_date.isoformat()
+        created_stale_note: List[str] = []
+        if created_at_str:
+            c_stale = _is_stale(created_at_str, ref_date, cfg["max_stale_days"])
+            if c_stale is not None:
+                created_stale_note.append(
+                    f"Lưu ý metadata: model created_at={created_at_str} đã cũ {c_stale} ngày (dù observed_last_date={observed_last_date} còn mới)."
+                )
+            elif observed_last_date and created_at_str < observed_last_date:
+                created_stale_note.append(
+                    f"Lưu ý metadata: model created_at={created_at_str} sớm hơn observed_last_date={observed_last_date}."
+                )
 
         # 1. Capacity Pressure Alert (chỉ khi có lịch chiếu xác nhận tại đúng grain)
         if cap_pressure_rows:
@@ -1252,10 +1443,10 @@ def evaluate_forecast_rules(
             eff_sev, eff_title, freshness, stale_notes = _apply_freshness_policy(
                 "HIGH",
                 base_title,
-                created_at_str or ref_date.isoformat(),
+                freshness_source_date,
                 ref_date,
                 cfg["max_stale_days"],
-                f"Forecast (created_at={created_at_str}, observed_last={observed_last_date or 'N/A'})",
+                f"Forecast (observed_last={observed_last_date or 'N/A'}, created_at={created_at_str})",
                 mode=mode,
                 is_actionable=True,
             )
@@ -1300,14 +1491,17 @@ def evaluate_forecast_rules(
                             "high_pressure_slots_count": len(cap_pressure_rows),
                             "model_created_at": created_at_str,
                             "observed_last_date": observed_last_date,
+                            "lookahead_leakage_risk": lookahead_risk,
                             "freshness": freshness,
                         }
                     ],
                     source_model="forecast",
-                    as_of_date=created_at_str or ref_date.isoformat(),
+                    as_of_date=freshness_source_date,
                     limitations=[
                         "Khoảng [yhat_lower, yhat_upper] là khoảng heuristic từ độ lệch chuẩn phần dư out-of-sample (±1.96*std), không phải bảo đảm xác suất 95%.",
                         "yhat là số vé dự báo, khác với occupancy; occupancy chỉ được tính khi có tổng sức chứa từ lịch chiếu xác nhận.",
+                        *created_stale_note,
+                        *audit_notes,
                         *stale_notes,
                     ],
                 )
@@ -1327,10 +1521,10 @@ def evaluate_forecast_rules(
             eff_sev, eff_title, freshness, stale_notes = _apply_freshness_policy(
                 "MEDIUM",
                 base_title,
-                created_at_str or ref_date.isoformat(),
+                freshness_source_date,
                 ref_date,
                 cfg["max_stale_days"],
-                f"Forecast (created_at={created_at_str}, observed_last={observed_last_date or 'N/A'})",
+                f"Forecast (observed_last={observed_last_date or 'N/A'}, created_at={created_at_str})",
                 mode=mode,
                 is_actionable=True,
             )
@@ -1372,15 +1566,18 @@ def evaluate_forecast_rules(
                             "surge_slots_count": len(demand_surge_rows),
                             "model_created_at": created_at_str,
                             "observed_last_date": observed_last_date,
+                            "lookahead_leakage_risk": lookahead_risk,
                             "freshness": freshness,
                         }
                     ],
                     source_model="forecast",
-                    as_of_date=created_at_str or ref_date.isoformat(),
+                    as_of_date=freshness_source_date,
                     limitations=[
                         "Chưa có lịch chiếu xác nhận (showtime_schedule) nên không tính được occupancy và không kết luận rạp gần đầy.",
                         "Không khuyến nghị mở thêm suất khi chưa kiểm tra năng lực phòng chiếu.",
                         "Khoảng [yhat_lower, yhat_upper] là khoảng heuristic (±1.96*std).",
+                        *created_stale_note,
+                        *audit_notes,
                         *stale_notes,
                     ],
                 )
@@ -1419,9 +1616,26 @@ def evaluate_review_rules(
     if reviews_df is None or reviews_df.empty or "cinema_key" not in reviews_df.columns:
         return decisions
 
+    ref_date = reference_date or date.today()
     name_map = cinema_name_map or {}
 
-    for cinema_key, grp in reviews_df.groupby("cinema_key"):
+    rev_df = reviews_df.copy()
+    prev_df = prev_reviews_df.copy() if prev_reviews_df is not None else None
+    audit_notes: List[str] = []
+    if mode == "historical_audit":
+        if "published_date" in rev_df.columns:
+            rev_df["_pdate"] = pd.to_datetime(rev_df["published_date"], errors="coerce").dt.date
+            rev_df = rev_df[rev_df["_pdate"].notna() & (rev_df["_pdate"] <= ref_date)]
+        if prev_df is not None and not prev_df.empty and "published_date" in prev_df.columns:
+            prev_df["_pdate"] = pd.to_datetime(prev_df["published_date"], errors="coerce").dt.date
+            prev_df = prev_df[prev_df["_pdate"].notna() & (prev_df["_pdate"] <= ref_date)]
+        audit_notes.append(
+            "Chế độ HISTORICAL_AUDIT chỉ phục vụ kiểm toán hậu kiểm; không phải kết quả historical backtest chính thức."
+        )
+    if rev_df.empty:
+        return decisions
+
+    for cinema_key, grp in rev_df.groupby("cinema_key"):
         if pd.isna(cinema_key):
             continue
         ck = int(cinema_key)
@@ -1431,8 +1645,8 @@ def evaluate_review_rules(
             continue
 
         prev_grp = None
-        if prev_reviews_df is not None and not prev_reviews_df.empty and "cinema_key" in prev_reviews_df.columns:
-            p_sub = prev_reviews_df[prev_reviews_df["cinema_key"] == ck]
+        if prev_df is not None and not prev_df.empty and "cinema_key" in prev_df.columns:
+            p_sub = prev_df[prev_df["cinema_key"] == ck]
             if len(p_sub) >= min_sample:
                 prev_grp = p_sub
 
@@ -1440,9 +1654,8 @@ def evaluate_review_rules(
         as_of = (
             _to_iso_date(pd.to_datetime(grp["published_date"], errors="coerce").max())
             if "published_date" in grp.columns
-            else date.today().isoformat()
+            else ref_date.isoformat()
         )
-        ref_date = reference_date or (date.fromisoformat(as_of) if as_of else date.today())
         time_scope = f"reviews_as_of_{as_of}"
 
         for ins in insights:
@@ -1501,11 +1714,12 @@ def evaluate_review_rules(
                         }
                     ],
                     source_model="review_nlp",
-                    as_of_date=as_of or date.today().isoformat(),
+                    as_of_date=as_of or ref_date.isoformat(),
                     limitations=[
                         "Sentiment và topic được ước lượng bằng thuật toán lexicon/rating (Task 8 chưa hoàn tất Human Ground Truth chính thức).",
                         "Mô hình phân loại cấp độ toàn review (chưa phải ABSA theo từng khía cạnh).",
                         "root_causes là giả thuyết từ từ điển vận hành, cần kiểm chứng bằng nội dung review gốc.",
+                        *audit_notes,
                         *stale_notes,
                     ],
                 )
@@ -1588,6 +1802,7 @@ def run_dss_from_dataframes(
     if mode not in VALID_MODES:
         raise ValueError(f"Invalid mode '{mode}'. Must be one of {VALID_MODES}.")
 
+    effective_ref_date = reference_date or date.today()
     raw_decisions: List[Decision] = []
 
     raw_decisions.extend(
@@ -1596,7 +1811,7 @@ def run_dss_from_dataframes(
             occupancy_df=occupancy_df,
             fnb_attach_df=fnb_attach_df,
             anomaly_df=anomaly_df,
-            reference_date=reference_date,
+            reference_date=effective_ref_date,
             thresholds=thresholds,
             mode=mode,
         )
@@ -1604,7 +1819,7 @@ def run_dss_from_dataframes(
     raw_decisions.extend(
         evaluate_rfm_rules(
             profile_df=rfm_profile_df,
-            reference_date=reference_date,
+            reference_date=effective_ref_date,
             member_last_txn_date=member_last_txn_date,
             thresholds=thresholds,
             mode=mode,
@@ -1616,7 +1831,7 @@ def run_dss_from_dataframes(
             cinema_capacity_map=cinema_capacity_map,
             cinema_name_map=cinema_name_map,
             expected_cinema_keys=expected_cinema_keys,
-            reference_date=reference_date,
+            reference_date=effective_ref_date,
             schedule_df=schedule_df,
             hist_slot_df=hist_slot_df,
             observed_last_date=observed_last_date,
@@ -1630,7 +1845,7 @@ def run_dss_from_dataframes(
             prev_reviews_df=prev_reviews_df,
             cinema_name_map=cinema_name_map,
             min_sample=(thresholds or {}).get("rev_min_sample", DEFAULT_THRESHOLDS["rev_min_sample"]),
-            reference_date=reference_date,
+            reference_date=effective_ref_date,
             thresholds=thresholds,
             mode=mode,
         )
@@ -1798,5 +2013,6 @@ def run_dss(
     mode: str = "operational",
 ) -> List[Decision]:
     """Chạy DSS Engine trực tiếp trên PostgreSQL `cinema_dw` (read-only)."""
+    effective_ref_date = reference_date or date.today()
     inputs = load_dss_inputs_from_db(engine, cinema_key=cinema_key)
-    return run_dss_from_dataframes(**inputs, reference_date=reference_date, mode=mode)
+    return run_dss_from_dataframes(**inputs, reference_date=effective_ref_date, mode=mode)

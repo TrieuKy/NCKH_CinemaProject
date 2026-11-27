@@ -57,20 +57,21 @@ def _make_daily_kpi(
 
 
 def test_kpi_rev_drop_exact_boundary_and_severity():
-    # Giảm đúng -15.0% -> kích hoạt HIGH
-    df_15 = _make_daily_kpi(prev_rev=100_000_000.0, curr_rev=85_000_000.0)
-    res_15 = evaluate_kpi_rules(df_15)
+    end_d = date(2026, 9, 30)
+    # Giảm đúng -15.0% -> kích hoạt HIGH (đánh giá tại đúng ngày kết thúc dữ liệu)
+    df_15 = _make_daily_kpi(prev_rev=100_000_000.0, curr_rev=85_000_000.0, end_date=end_d)
+    res_15 = evaluate_kpi_rules(df_15, reference_date=end_d)
     assert len(res_15) == 1
     assert res_15[0].rule_id == "KPI-REV-DROP"
     assert res_15[0].severity == "HIGH"
 
     # Giảm -14.9% -> không kích hoạt
-    df_149 = _make_daily_kpi(prev_rev=100_000_000.0, curr_rev=85_100_000.0)
-    assert evaluate_kpi_rules(df_149) == []
+    df_149 = _make_daily_kpi(prev_rev=100_000_000.0, curr_rev=85_100_000.0, end_date=end_d)
+    assert evaluate_kpi_rules(df_149, reference_date=end_d) == []
 
     # Giảm đúng -25.0% -> kích hoạt CRITICAL
-    df_25 = _make_daily_kpi(prev_rev=100_000_000.0, curr_rev=75_000_000.0)
-    res_25 = evaluate_kpi_rules(df_25)
+    df_25 = _make_daily_kpi(prev_rev=100_000_000.0, curr_rev=75_000_000.0, end_date=end_d)
+    res_25 = evaluate_kpi_rules(df_25, reference_date=end_d)
     assert len(res_25) == 1
     assert res_25[0].severity == "CRITICAL"
 
@@ -84,7 +85,11 @@ def test_kpi_occupancy_weighted_and_low_demand():
         ]
     )
     # weighted = 45/200 = 0.225 < 0.25 -> HIGH
-    res = evaluate_kpi_rules(_make_daily_kpi(cinema_key=3, cinema_name="CGV Pearl Plaza"), occupancy_df=occ_df)
+    res = evaluate_kpi_rules(
+        _make_daily_kpi(cinema_key=3, cinema_name="CGV Pearl Plaza", end_date=end_d),
+        occupancy_df=occ_df,
+        reference_date=end_d,
+    )
     occ_decisions = [d for d in res if d.rule_id == "KPI-OCC-LOW"]
     assert len(occ_decisions) == 1
     assert occ_decisions[0].severity == "HIGH"
@@ -227,6 +232,7 @@ def test_forecast_peak_demand_and_missing_data_guard():
         expected_cinema_keys=[1, 2],
         reference_date=ref,
         schedule_df=pd.DataFrame(sched_rows),
+        observed_last_date=ref.isoformat(),
     )
     by_ck = {d.cinema_key: d for d in res}
     assert by_ck[1].rule_id == "FC-PEAK-DEMAND"
@@ -262,7 +268,11 @@ def test_review_cinema_isolation_and_min_sample():
             }
         )
     df = pd.DataFrame(rows)
-    res = evaluate_review_rules(df, cinema_name_map={1: "CGV Landmark 81", 2: "CGV Vincom Đồng Khởi"})
+    res = evaluate_review_rules(
+        df,
+        cinema_name_map={1: "CGV Landmark 81", 2: "CGV Vincom Đồng Khởi"},
+        reference_date=date(2026, 10, 1),
+    )
     assert len(res) == 1
     assert res[0].cinema_key == 1
     assert res[0].rule_id == "REV-TOPIC-ALERT"
@@ -404,7 +414,13 @@ def test_fix1_forecast_temporal_validity_expired_and_mixed_and_audit():
     sched_fut = pd.DataFrame(
         [{"show_date": ref + timedelta(days=i), "cinema_key": 1, "time_slot": "Tối", "capacity": 400} for i in range(1, 6)]
     )
-    res_mixed = evaluate_forecast_rules(mixed_fc, reference_date=ref, schedule_df=sched_fut, expected_cinema_keys=[1])
+    res_mixed = evaluate_forecast_rules(
+        mixed_fc,
+        reference_date=ref,
+        schedule_df=sched_fut,
+        expected_cinema_keys=[1],
+        observed_last_date=ref.isoformat(),
+    )
     rule_ids = {d.rule_id for d in res_mixed}
     assert "FC-PEAK-DEMAND" in rule_ids
     assert "FC-DATA-GAP" in rule_ids  # thiếu 9/14 ngày horizon
@@ -420,7 +436,9 @@ def test_fix2_forecast_capacity_semantics_and_demand_surge():
     sched_400 = pd.DataFrame(
         [{"show_date": ref + timedelta(days=i), "cinema_key": 1, "time_slot": "Tối", "capacity": 400} for i in range(1, 15)]
     )
-    res_90 = evaluate_forecast_rules(fc, reference_date=ref, schedule_df=sched_400, expected_cinema_keys=[1])
+    res_90 = evaluate_forecast_rules(
+        fc, reference_date=ref, schedule_df=sched_400, expected_cinema_keys=[1], observed_last_date=ref.isoformat()
+    )
     assert len(res_90) == 1
     assert res_90[0].rule_id == "FC-PEAK-DEMAND"
     assert res_90[0].evidence[0]["projected_occupancy_ratio"] == 0.9
@@ -433,24 +451,38 @@ def test_fix2_forecast_capacity_semantics_and_demand_surge():
             for _ in range(2)
         ]
     )
-    res_45 = evaluate_forecast_rules(fc, reference_date=ref, schedule_df=sched_800, expected_cinema_keys=[1])
+    res_45 = evaluate_forecast_rules(
+        fc, reference_date=ref, schedule_df=sched_800, expected_cinema_keys=[1], observed_last_date=ref.isoformat()
+    )
     assert res_45 == []
 
     # 3. Không có lịch chiếu -> không kết luận occupancy, không phát FC-PEAK-DEMAND
     res_nosched = evaluate_forecast_rules(
-        fc, cinema_capacity_map={1: 400}, reference_date=ref, schedule_df=None, expected_cinema_keys=[1]
+        fc,
+        cinema_capacity_map={1: 400},
+        reference_date=ref,
+        schedule_df=None,
+        expected_cinema_keys=[1],
+        observed_last_date=ref.isoformat(),
     )
     assert not any(d.rule_id == "FC-PEAK-DEMAND" for d in res_nosched)
 
     # 4. Ngày không mở suất Sáng -> không tạo áp lực công suất giả cho Sáng
     fc_morning = _make_14d_forecast(ref, cinema_key=1, yhat=380.0, slot="Sáng")
-    res_morning = evaluate_forecast_rules(fc_morning, reference_date=ref, schedule_df=sched_400, expected_cinema_keys=[1])
+    res_morning = evaluate_forecast_rules(
+        fc_morning, reference_date=ref, schedule_df=sched_400, expected_cinema_keys=[1], observed_last_date=ref.isoformat()
+    )
     assert not any(d.rule_id == "FC-PEAK-DEMAND" for d in res_morning)
 
     # 5. Không có lịch chiếu nhưng có lịch sử hợp lệ -> chỉ phát FC-DEMAND-SURGE (Demand Surge Alert)
     hist_df = pd.DataFrame([{"cinema_key": 1, "time_slot": "Tối", "qty_clean": 200.0}])
     res_surge = evaluate_forecast_rules(
-        fc, reference_date=ref, schedule_df=None, hist_slot_df=hist_df, expected_cinema_keys=[1]
+        fc,
+        reference_date=ref,
+        schedule_df=None,
+        hist_slot_df=hist_df,
+        expected_cinema_keys=[1],
+        observed_last_date=ref.isoformat(),
     )
     assert len(res_surge) == 1
     assert res_surge[0].rule_id == "FC-DEMAND-SURGE"
@@ -501,3 +533,283 @@ def test_fix4_data_freshness_downgrades_stale_actionable_decisions():
     assert res[0].severity == "HIGH"  # downgraded from CRITICAL
     assert res[0].explanation["decision_mode"] == "HISTORICAL_ANALYSIS_ONLY"
     assert res[0].evidence[0]["freshness"]["is_stale"] is True
+
+
+# ---------------------------------------------------------------------------
+# Task 9.2 — Unified Reference Date, Forecast Source Freshness,
+# Strict 14-Day Horizon & Historical Audit Look-Ahead Leakage
+# ---------------------------------------------------------------------------
+def test_task92_fix_a_unified_reference_date():
+    # Dữ liệu KPI kết thúc 2026-09-30, Review kết thúc 2026-10-16
+    kpi = _make_daily_kpi(prev_rev=100_000_000.0, curr_rev=70_000_000.0, end_date=date(2026, 9, 30))
+    rev_rows = [
+        {
+            "review_id": f"cn1_{i}",
+            "cinema_key": 1,
+            "rating": 1.0 if i < 6 else 5.0,
+            "published_date": date(2026, 10, 16),
+            "sentiment_final": "NEGATIVE" if i < 6 else "POSITIVE",
+            "topics": ["Vệ sinh"],
+        }
+        for i in range(12)
+    ]
+    rev_df = pd.DataFrame(rev_rows)
+
+    # 1. Gọi với reference_date=date(2026, 11, 27): cả KPI (58 ngày) và Review (42 ngày) đều phải bị nhận diện là cũ
+    res_fixed = run_dss_from_dataframes(
+        daily_kpi_df=kpi,
+        reviews_df=rev_df,
+        cinema_name_map={1: "CGV Landmark 81"},
+        reference_date=date(2026, 11, 27),
+    )
+    assert len(res_fixed) >= 2
+    kpi_dec = next(d for d in res_fixed if d.rule_id == "KPI-REV-DROP")
+    rev_dec = next(d for d in res_fixed if d.rule_id == "REV-TOPIC-ALERT")
+    for d in (kpi_dec, rev_dec):
+        assert d.explanation["decision_mode"] == "HISTORICAL_ANALYSIS_ONLY"
+        assert d.evidence[0]["freshness"]["is_stale"] is True
+        assert d.evidence[0]["freshness"]["reference_date"] == "2026-11-27"
+    assert kpi_dec.severity == "HIGH"     # downgraded from CRITICAL
+    assert rev_dec.severity == "MEDIUM"   # downgraded from HIGH
+
+    # 2. Gọi không truyền reference_date -> dùng date.today(), không tự lấy max_date/published_date
+    res_default = run_dss_from_dataframes(
+        daily_kpi_df=kpi,
+        reviews_df=rev_df,
+        cinema_name_map={1: "CGV Landmark 81"},
+    )
+    today_iso = date.today().isoformat()
+    for d in res_default:
+        ev = d.evidence[0]
+        actual_ref = ev["freshness"]["reference_date"] if "freshness" in ev else ev["reference_date"]
+        assert actual_ref == today_iso
+        if d.rule_id in ("KPI-REV-DROP", "REV-TOPIC-ALERT") and date.today() >= date(2026, 11, 16):
+            assert d.explanation["decision_mode"] == "HISTORICAL_ANALYSIS_ONLY"
+
+
+def test_task92_fix_b_forecast_source_data_freshness():
+    ref = date(2026, 11, 27)
+    fc = _make_14d_forecast(ref, cinema_key=1, yhat=360.0, slot="Tối", created_at="2026-11-25")
+    sched = pd.DataFrame(
+        [{"show_date": ref + timedelta(days=i), "cinema_key": 1, "time_slot": "Tối", "capacity": 400} for i in range(1, 15)]
+    )
+
+    # 1. Target tương lai, created_at mới (2026-11-25), nhưng observed_last_date quá cũ (2026-09-30) -> chặn demand alert, phát FC-DATA-GAP
+    res_stale_obs = evaluate_forecast_rules(
+        fc,
+        reference_date=ref,
+        schedule_df=sched,
+        expected_cinema_keys=[1],
+        observed_last_date="2026-09-30",
+    )
+    assert not any(d.rule_id in ("FC-PEAK-DEMAND", "FC-DEMAND-SURGE") for d in res_stale_obs)
+    assert len(res_stale_obs) == 1
+    gap = res_stale_obs[0]
+    assert gap.rule_id == "FC-DATA-GAP"
+    assert gap.evidence[0]["reason"] == "stale_observed_source"
+    assert gap.evidence[0]["observed_last_date"] == "2026-09-30"
+    assert gap.evidence[0]["model_created_at"] == "2026-11-25"
+    assert "FC-PEAK-DEMAND" in gap.evidence[0]["blocked_rules"]
+
+    # 2. Target tương lai, nguồn dữ liệu còn hợp lệ (observed_last_date=2026-11-25) -> OPERATIONAL FC-PEAK-DEMAND
+    res_fresh = evaluate_forecast_rules(
+        fc,
+        reference_date=ref,
+        schedule_df=sched,
+        expected_cinema_keys=[1],
+        observed_last_date="2026-11-25",
+    )
+    assert len(res_fresh) == 1
+    assert res_fresh[0].rule_id == "FC-PEAK-DEMAND"
+    assert res_fresh[0].explanation["decision_mode"] == "OPERATIONAL"
+    assert res_fresh[0].severity == "HIGH"
+
+    # 3. Thiếu observed_last_date (None) -> chặn demand alert, phát FC-DATA-GAP
+    res_missing_obs = evaluate_forecast_rules(
+        fc,
+        reference_date=ref,
+        schedule_df=sched,
+        expected_cinema_keys=[1],
+        observed_last_date=None,
+    )
+    assert not any(d.rule_id in ("FC-PEAK-DEMAND", "FC-DEMAND-SURGE") for d in res_missing_obs)
+    assert len(res_missing_obs) == 1
+    assert res_missing_obs[0].evidence[0]["reason"] == "missing_observed_date"
+
+    # 4. created_at cũ (2026-10-01) nhưng observed_last_date mới (2026-11-25) -> vẫn dùng observed_last_date để đánh giá độ mới
+    fc_old_created = _make_14d_forecast(ref, cinema_key=1, yhat=360.0, slot="Tối", created_at="2026-10-01")
+    res_old_created = evaluate_forecast_rules(
+        fc_old_created,
+        reference_date=ref,
+        schedule_df=sched,
+        expected_cinema_keys=[1],
+        observed_last_date="2026-11-25",
+    )
+    assert len(res_old_created) == 1
+    assert res_old_created[0].rule_id == "FC-PEAK-DEMAND"
+    assert res_old_created[0].explanation["decision_mode"] == "OPERATIONAL"
+    assert any("created_at" in lim for lim in res_old_created[0].limitations)
+
+    # 5. Historical Audit không bị hiểu nhầm là quyết định hiện hành
+    res_audit = evaluate_forecast_rules(
+        fc,
+        reference_date=ref,
+        schedule_df=sched,
+        expected_cinema_keys=[1],
+        observed_last_date="2026-09-30",
+        mode="historical_audit",
+    )
+    peak_audit = next(d for d in res_audit if d.rule_id == "FC-PEAK-DEMAND")
+    assert peak_audit.explanation["decision_mode"] == "HISTORICAL_AUDIT"
+    assert peak_audit.title.startswith("[LỊCH SỬ / AUDIT]")
+
+
+def test_task92_fix_c_strict_14_day_forecast_horizon():
+    ref = date(2026, 11, 27)
+    hist_df = pd.DataFrame([{"cinema_key": 1, "time_slot": "Tối", "qty_clean": 100.0}])
+
+    def _row(day_offset: int, yhat: float = 360.0) -> dict:
+        return {
+            "target_date": ref + timedelta(days=day_offset),
+            "cinema_key": 1,
+            "time_slot": "Tối",
+            "model_name": "xgboost",
+            "yhat": yhat,
+            "is_test": False,
+            "created_at": pd.Timestamp("2026-11-27"),
+        }
+
+    # 1. Ngày thứ 1 và ngày thứ 14 nằm trong horizon -> kích hoạt FC-PEAK-DEMAND
+    fc_1_14 = pd.DataFrame([_row(i, yhat=360.0 if i in (1, 14) else 100.0) for i in range(1, 15)])
+    sched_1_14 = pd.DataFrame(
+        [{"show_date": ref + timedelta(days=i), "cinema_key": 1, "time_slot": "Tối", "capacity": 400} for i in range(1, 15)]
+    )
+    res_1_14 = evaluate_forecast_rules(
+        fc_1_14, reference_date=ref, schedule_df=sched_1_14, expected_cinema_keys=[1], observed_last_date=ref.isoformat()
+    )
+    assert len(res_1_14) == 1
+    assert res_1_14[0].rule_id == "FC-PEAK-DEMAND"
+    assert res_1_14[0].evidence[0]["high_pressure_slots_count"] == 2
+
+    # 2. Chỉ có ngày thứ 15 và 30 -> ngoài horizon, không kích hoạt FC-PEAK-DEMAND hay FC-DEMAND-SURGE
+    fc_beyond = pd.DataFrame([_row(15, yhat=500.0), _row(30, yhat=500.0)])
+    sched_beyond = pd.DataFrame(
+        [
+            {"show_date": ref + timedelta(days=15), "cinema_key": 1, "time_slot": "Tối", "capacity": 400},
+            {"show_date": ref + timedelta(days=30), "cinema_key": 1, "time_slot": "Tối", "capacity": 400},
+        ]
+    )
+    res_beyond = evaluate_forecast_rules(
+        fc_beyond,
+        reference_date=ref,
+        schedule_df=sched_beyond,
+        hist_slot_df=hist_df,
+        expected_cinema_keys=[1],
+        observed_last_date=ref.isoformat(),
+    )
+    assert not any(d.rule_id in ("FC-PEAK-DEMAND", "FC-DEMAND-SURGE") for d in res_beyond)
+    assert len(res_beyond) == 1
+    assert res_beyond[0].rule_id == "FC-DATA-GAP"
+    assert res_beyond[0].evidence[0]["reason"] == "all_forecasts_beyond_horizon"
+    assert res_beyond[0].evidence[0]["beyond_horizon_rows"] == 2
+
+    # 3. Dữ liệu hỗn hợp: ngày 1..13 trong horizon (thiếu ngày 14) + ngày 15..20 ngoài horizon
+    # Ngày 15 không được lấp ngày 14 bị thiếu và không được kích hoạt FC-DEMAND-SURGE
+    fc_mixed = pd.DataFrame(
+        [_row(i, yhat=100.0) for i in range(1, 14)] + [_row(15, yhat=500.0), _row(20, yhat=500.0)]
+    )
+    res_mixed = evaluate_forecast_rules(
+        fc_mixed,
+        reference_date=ref,
+        schedule_df=None,
+        hist_slot_df=hist_df,
+        expected_cinema_keys=[1],
+        observed_last_date=ref.isoformat(),
+    )
+    assert not any(d.rule_id in ("FC-PEAK-DEMAND", "FC-DEMAND-SURGE") for d in res_mixed)
+    assert len(res_mixed) == 1
+    assert res_mixed[0].rule_id == "FC-DATA-GAP"
+    assert res_mixed[0].evidence[0]["covered_days"] == 13
+    assert (ref + timedelta(days=14)).isoformat() in res_mixed[0].evidence[0]["missing_dates"]
+    assert res_mixed[0].evidence[0]["beyond_horizon_rows_ignored"] == 2
+
+
+def test_task92_fix_d_historical_audit_lookahead_leakage_guards():
+    replay_date = date(2026, 9, 20)
+
+    # 1. hist_slot_df có dữ liệu sau replay_date (2026-09-25 = 1000 vé) làm tăng giả baseline nếu bị leak
+    hist_df = pd.DataFrame(
+        [
+            {"full_date": date(2026, 9, 15), "cinema_key": 1, "time_slot": "Tối", "qty_clean": 100.0},
+            {"full_date": date(2026, 9, 25), "cinema_key": 1, "time_slot": "Tối", "qty_clean": 1000.0},
+        ]
+    )
+    fc_replay = pd.DataFrame(
+        [
+            {
+                "target_date": date(2026, 9, 21),
+                "cinema_key": 1,
+                "time_slot": "Tối",
+                "model_name": "xgboost",
+                "yhat": 150.0,  # 150 >= 1.25 * 100 (pre-replay mean), nhưng < 1.25 * 550 (leaked mean)
+                "is_test": False,
+                "created_at": pd.Timestamp("2026-11-25"),  # created AFTER replay_date -> lookahead risk
+            }
+        ]
+    )
+    res_fc = evaluate_forecast_rules(
+        fc_replay,
+        reference_date=replay_date,
+        hist_slot_df=hist_df,
+        expected_cinema_keys=[1],
+        observed_last_date="2026-09-30",
+        mode="historical_audit",
+    )
+    surge = next(d for d in res_fc if d.rule_id == "FC-DEMAND-SURGE")
+    assert surge.evidence[0]["hist_slot_mean"] == 100.0  # Không bị leak 1000.0 từ ngày 25/09
+    assert surge.evidence[0]["lookahead_leakage_risk"] is True
+    assert any("LOOK-AHEAD LEAKAGE" in lim for lim in surge.limitations)
+
+    # 2. KPI window không dùng dữ liệu sau replay_date
+    kpi_full = _make_daily_kpi(prev_rev=100_000_000.0, curr_rev=70_000_000.0, end_date=date(2026, 9, 30))
+    res_kpi = evaluate_kpi_rules(kpi_full, reference_date=replay_date, mode="historical_audit")
+    assert all(d.as_of_date <= replay_date.isoformat() for d in res_kpi)
+
+    # 3. Reviews sau replay_date bị loại khỏi historical_audit
+    rev_df = pd.DataFrame(
+        [
+            {
+                "review_id": f"r_{i}",
+                "cinema_key": 1,
+                "rating": 1.0,
+                "published_date": date(2026, 9, 10) if i < 5 else date(2026, 9, 25),
+                "sentiment_final": "NEGATIVE",
+                "topics": ["Vệ sinh"],
+            }
+            for i in range(12)
+        ]
+    )
+    # Chỉ có 5 review <= 2026-09-20 (< min_sample=10) -> không sinh quyết định từ review tương lai
+    res_rev = evaluate_review_rules(rev_df, reference_date=replay_date, mode="historical_audit")
+    assert res_rev == []
+
+    # 4. RFM snapshot cảnh báo giới hạn không thể tái lập lịch sử & look-ahead nếu updated_at > replay_date
+    rfm_df = pd.DataFrame(
+        [
+            {
+                "cluster_id": 0,
+                "cluster_name": "Có nguy cơ rời bỏ",
+                "customer_count": 100,
+                "pct_customers": 20.0,
+                "avg_recency": 150.0,
+                "avg_frequency": 1.5,
+                "avg_monetary": 300000.0,
+                "updated_at": pd.Timestamp("2026-11-19"),
+            }
+        ]
+    )
+    res_rfm = evaluate_rfm_rules(
+        rfm_df, reference_date=replay_date, member_last_txn_date="2026-09-30", mode="historical_audit"
+    )
+    assert any("snapshot hiện tại" in lim for lim in res_rfm[0].limitations)
+    assert any("LOOK-AHEAD LEAKAGE" in lim for lim in res_rfm[0].limitations)
