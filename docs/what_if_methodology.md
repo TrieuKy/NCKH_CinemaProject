@@ -44,10 +44,21 @@ Baseline được truy vấn **chỉ đọc (Read-Only)** từ 3 view độc l�
 - **Giả định bắt buộc:** *"Giả định giữ nguyên lượng vé bán; chưa mô hình hóa phản ứng nhu cầu của khách hàng đối với thay đổi giá."*
 
 ### Scenario B — Thay đổi Lượng vé & Sức chứa (`TICKET_VOLUME`)
-- `Scenario Ticket Qty = round_half_up(Baseline Ticket Qty Clean × (1 + qty_change_pct))`
-- `Scenario Ticket Revenue = Scenario Ticket Qty × Baseline ATP`
-- `Scenario Occupancy = Scenario Ticket Qty / Observed Showtime Capacity`
-- **Capacity Safeguards:** Nếu `Scenario Ticket Qty > Observed Showtime Capacity`, đánh dấu `CAPACITY_EXCEEDED`, tách phần `unmet_demand_tickets` và `feasible_ticket_revenue_clean` thay vì âm thầm biến nhu cầu vượt ngưỡng thành doanh thu đã bán. Nếu thiếu `capacity`, không công bố `occupancy`.
+- `Potential Ticket Qty = round_half_up(Baseline Ticket Qty Clean × (1 + qty_change_pct))`
+- `Potential Ticket Revenue = Potential Ticket Qty × Baseline ATP`
+- `Aggregate Capacity Upper Bound = Observed Showtime Capacity`
+- `Capacity-Constrained Ticket Revenue Upper Bound = min(Potential Ticket Qty, Aggregate Capacity Upper Bound) × Baseline ATP`
+- `Scenario Occupancy (Aggregate Check) = min(Potential Ticket Qty, Aggregate Capacity Upper Bound) / Aggregate Capacity Upper Bound`
+- **Phân tách doanh thu bắt buộc:** Không bao giờ trình bày `Potential Ticket Revenue` (khi vượt sức chứa) như doanh thu có thể bán hết. Khi `Potential Ticket Qty > Aggregate Capacity Upper Bound`, hệ thống đánh dấu `CAPACITY_EXCEEDED`, tách riêng `unmet_demand_tickets` và dùng `Capacity-Constrained Revenue Upper Bound` làm giới hạn trên doanh thu tổng hợp.
+- **Ngữ nghĩa kiểm tra sức chứa (`AGGREGATE_CAPACITY_CHECK`):**
+  - `VALID` nghĩa là hợp lệ về mặt toán học trong giới hạn tổng ghế toàn kỳ (`UNVERIFIED_AT_SHOWTIME_GRAIN`), **không** đồng nghĩa `OPERATIONALLY_FEASIBLE` theo từng suất chiếu (phim × phòng × giờ chiếu).
+  - Ghế trống ở suất chiếu khác không tự động bù đắp cho một suất chiếu đã bán hết (`sold_out_showtime_count > 0` sẽ phát cảnh báo).
+  - Nếu thiếu `capacity`, không công bố `occupancy` (`UNVERIFIED_MISSING_CAPACITY`).
+
+### Đối soát dữ liệu nền (`2025-10-01` → `2026-09-30`)
+- Tổng `ticket_qty_clean` trên `vw_daily_kpi` (`805,664`), `vw_showtime_occupancy` (`805,664`), và `fact_ticket` (`SUM(CASE WHEN is_anomaly=0 THEN qty ELSE 0 END) = 805,664`) khớp 100% theo toàn kỳ, từng rạp (CN01: `361,172`, CN02: `273,673`, CN03: `170,819`) và từng tháng.
+- Con số `604,718` ở một báo cáo trước tương ứng kỳ 9 tháng `2026-01-01` → `2026-09-30`, không phải sai lệch nguồn dữ liệu.
+- `vw_daily_kpi.fnb_revenue_clean` (`32,202,975,000` VND) khớp 100% với `vw_fnb_attach.fnb_revenue_clean`; lưu ý `vw_fnb_attach.fnb_txn_count` (`229,593`) là đếm Raw (gồm ~`0.84%` giao dịch anomaly) theo đúng mô hình Hybrid đã nghiệm thu.
 
 ### Scenario C — Thay đổi Tỷ lệ mua kèm F&B (`FNB_ATTACH`)
 - `Baseline Attach Rate = fnb_txn_count / ticket_txn_count` (Raw)

@@ -91,6 +91,8 @@ class BaselineMetrics:
     data_freshness: str = "HISTORICAL_BASELINE"
     limitations: tuple[str, ...] = field(default_factory=tuple)
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    sold_out_showtime_count: int = 0
+    capacity_reconciled: bool = True
 
     @property
     def fingerprint(self) -> str:
@@ -142,6 +144,8 @@ class ScenarioResult:
     baseline_fingerprint: str
     data_classification: str = "HYPOTHETICAL_SCENARIO"
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    capacity_check_scope: str = "NOT_APPLICABLE"
+    operational_feasibility_status: str = "NOT_APPLICABLE"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -163,6 +167,8 @@ class ScenarioResult:
             "baseline_fingerprint": self.baseline_fingerprint,
             "data_classification": self.data_classification,
             "created_at": self.created_at,
+            "capacity_check_scope": self.capacity_check_scope,
+            "operational_feasibility_status": self.operational_feasibility_status,
         }
 
 
@@ -231,7 +237,8 @@ def fetch_baseline_from_db(
         SELECT
             COUNT(*)                       AS showtime_count,
             COALESCE(SUM(o.capacity), 0)   AS total_capacity,
-            COALESCE(SUM(o.qty_clean), 0)  AS showtime_qty_clean
+            COALESCE(SUM(o.qty_clean), 0)  AS showtime_qty_clean,
+            COALESCE(SUM(CASE WHEN o.capacity > 0 AND o.qty_clean >= o.capacity THEN 1 ELSE 0 END), 0) AS sold_out_showtime_count
         FROM cinema_dw.vw_showtime_occupancy o
         JOIN cinema_dw.dim_cinema dc ON o.cinema_name = dc.cinema_name
         WHERE o.date_key BETWEEN :start_key AND :end_key
@@ -269,6 +276,7 @@ def fetch_baseline_from_db(
     showtime_count = int(occ_row[0] or 0) if occ_row else 0
     total_capacity_raw = int(occ_row[1] or 0) if occ_row else 0
     showtime_qty_clean = int(occ_row[2] or 0) if occ_row else 0
+    sold_out_showtime_count = int(occ_row[3] or 0) if occ_row else 0
     available_capacity = total_capacity_raw if (showtime_count > 0 and total_capacity_raw > 0) else None
     weighted_occupancy = (
         (showtime_qty_clean / available_capacity)
@@ -290,17 +298,25 @@ def fetch_baseline_from_db(
         "Không sử dụng kết quả forecast đã hết hạn (EXPIRED) làm dữ liệu đầu vào mô phỏng.",
     ]
     warnings: list[str] = []
+    capacity_reconciled = True
 
     if available_capacity is None:
         warnings.append("Không có dữ liệu sức chứa suất chiếu (capacity) trong phạm vi đã chọn.")
     if abs(fnb_rev_from_attach - fnb_revenue_clean) > 1.0:
         warnings.append(
-            "Doanh thu F&B từ vw_daily_kpi và vw_fnb_attach có chênh lệch nhỏ; "
-            "sử dụng fnb_revenue_clean từ vw_daily_kpi làm chuẩn."
+            "Doanh thu F&B từ vw_daily_kpi và vw_fnb_attach có chênh lệch; "
+            "sử dụng fnb_revenue_clean từ vw_daily_kpi làm chuẩn và không coi hai tổng hợp tương đương."
         )
     if showtime_count > 0 and showtime_qty_clean != ticket_qty_clean:
+        capacity_reconciled = False
         warnings.append(
-            f"Số vé sạch ở grain ngày ({ticket_qty_clean:,}) khác grain suất chiếu ({showtime_qty_clean:,})."
+            f"CẢNH BÁO ĐỐI SOÁT: Số vé sạch ở grain ngày ({ticket_qty_clean:,}) khác grain suất chiếu ({showtime_qty_clean:,}); "
+            "các kịch bản dùng sức chứa suất chiếu chưa được đối soát hoàn toàn."
+        )
+    if sold_out_showtime_count > 0:
+        warnings.append(
+            f"Có {sold_out_showtime_count:,}/{showtime_count:,} suất chiếu đã đạt hoặc vượt 100% sức chứa trong kỳ baseline; "
+            "ghế trống ở suất khác không tự động đáp ứng cho suất đã bán hết."
         )
 
     cinema_name = CINEMA_NAMES.get(cinema_key, "Tất cả cụm rạp (CN01–CN03)") if cinema_key else "Tất cả cụm rạp (CN01–CN03)"
@@ -327,6 +343,8 @@ def fetch_baseline_from_db(
         spp_clean=spp_clean,
         limitations=tuple(limitations),
         warnings=tuple(warnings),
+        sold_out_showtime_count=sold_out_showtime_count,
+        capacity_reconciled=capacity_reconciled,
     )
 
 
@@ -479,7 +497,9 @@ def simulate_ticket_volume_change(
         "Doanh thu F&B giữ nguyên ở mức baseline (không tự suy diễn tăng F&B nếu chưa có mô hình liên kết).",
     ]
     limitations = list(baseline.limitations) + [
-        "Không tự giả định lịch chiếu mới hoặc nhân công suất phòng theo số suất giả định.",
+        "Kiểm tra sức chứa chỉ thực hiện ở cấp tổng hợp (AGGREGATE_CAPACITY_CHECK); chưa chứng minh khả thi vận hành theo từng suất chiếu (phim × phòng × giờ chiếu).",
+        "Không coi ghế trống ở suất chiếu khác là khả năng chắc chắn đáp ứng nhu cầu của một suất đã bán hết.",
+        "Không tự giả định lịch chiếu mới, phòng chiếu mới hoặc nhân công suất phòng theo số suất giả định.",
         "Không đề xuất mở thêm suất vì chưa có bằng chứng lịch chiếu và phòng khả dụng.",
     ]
     warnings = list(baseline.warnings)
@@ -502,6 +522,8 @@ def simulate_ticket_volume_change(
             validation_status="INSUFFICIENT_DATA",
             warnings=warnings + ["Không đủ dữ liệu vé sạch hoặc ATP baseline để mô phỏng lượng vé."],
             baseline_fingerprint=baseline.fingerprint,
+            capacity_check_scope="AGGREGATE_CAPACITY_UNAVAILABLE",
+            operational_feasibility_status="INSUFFICIENT_DATA",
         )
 
     if pct == 0.0:
@@ -512,18 +534,24 @@ def simulate_ticket_volume_change(
         scenario_rev = scenario_qty * baseline.atp_clean
 
     qty_delta = scenario_qty - baseline.ticket_qty_clean
-    rev_delta = scenario_rev - baseline.ticket_revenue_clean
-    rev_delta_pct = (rev_delta / baseline.ticket_revenue_clean) if baseline.ticket_revenue_clean > 0 else None
+    potential_rev_delta = scenario_rev - baseline.ticket_revenue_clean
+    potential_rev_delta_pct = (potential_rev_delta / baseline.ticket_revenue_clean) if baseline.ticket_revenue_clean > 0 else None
     qty_delta_pct = (qty_delta / baseline.ticket_qty_clean) if baseline.ticket_qty_clean > 0 else None
 
     cap = baseline.available_showtime_capacity
     validation_status = "VALID"
+    capacity_check_scope = "AGGREGATE_CAPACITY_CHECK"
+    operational_feasibility_status = "UNVERIFIED_AT_SHOWTIME_GRAIN"
     scenario_occupancy: Optional[float] = None
     unmet_demand_tickets = 0
     feasible_qty = scenario_qty
     feasible_rev = scenario_rev
+    cap_constrained_ticket_rev: Optional[float] = None
+    cap_constrained_total_rev: Optional[float] = None
 
     if cap is None or cap <= 0:
+        capacity_check_scope = "AGGREGATE_CAPACITY_UNAVAILABLE"
+        operational_feasibility_status = "UNVERIFIED_MISSING_CAPACITY"
         warnings.append(
             "Không đủ dữ liệu sức chứa suất chiếu (capacity) để kiểm tra giới hạn phòng chiếu; "
             "không công bố tỷ lệ lấp đầy (occupancy)."
@@ -531,43 +559,96 @@ def simulate_ticket_volume_change(
         limitations.append("Không kiểm chứng được giới hạn sức chứa do thiếu dữ liệu capacity ở grain suất chiếu.")
     else:
         raw_occ = scenario_qty / cap
+        cap_constrained_ticket_rev = feasible_rev
+        cap_constrained_total_rev = feasible_rev + baseline.fnb_revenue_clean
         if scenario_qty > cap:
             validation_status = "CAPACITY_EXCEEDED"
+            operational_feasibility_status = "CAPACITY_EXCEEDED_AGGREGATE"
             unmet_demand_tickets = scenario_qty - cap
             feasible_qty = cap
             feasible_rev = feasible_qty * baseline.atp_clean
-            scenario_occupancy = 1.0  # Thực tế tối đa lấp đầy 100% sức chứa hiện có
+            cap_constrained_ticket_rev = feasible_rev
+            cap_constrained_total_rev = feasible_rev + baseline.fnb_revenue_clean
+            scenario_occupancy = 1.0  # Giới hạn trên lấp đầy 100% tổng sức chứa quan sát được
             warnings.append(
-                f"CẢNH BÁO VƯỢT SỨC CHỨA: Nhu cầu mô phỏng ({scenario_qty:,} vé) vượt tổng sức chứa "
-                f"các suất chiếu quan sát được ({cap:,} ghế, tương đương {raw_occ:.1%}). "
-                f"Có {unmet_demand_tickets:,} vé nhu cầu không thể đáp ứng trong lịch chiếu hiện tại."
+                f"CẢNH BÁO VƯỢT SỨC CHỨA (AGGREGATE_CAPACITY_CHECK): Nhu cầu giả định ({scenario_qty:,} vé) vượt tổng sức chứa "
+                f"quan sát được ({cap:,} ghế, tương đương {raw_occ:.1%}). "
+                f"Có {unmet_demand_tickets:,} vé vượt sức chứa không thể đáp ứng; "
+                f"doanh thu vé tiềm năng ({scenario_rev:,.0f} VND) KHÔNG phải doanh thu có thể bán hết — "
+                f"giới hạn trên doanh thu vé theo sức chứa là {feasible_rev:,.0f} VND."
             )
         else:
             scenario_occupancy = raw_occ
+            if not baseline.capacity_reconciled:
+                validation_status = "UNRECONCILED_BASELINE"
+                operational_feasibility_status = "UNRECONCILED_CAPACITY_SOURCE"
+
+    # Khi CAPACITY_EXCEEDED, total_revenue_clean và ticket_revenue_clean không được trình bày
+    # bằng doanh thu từ lượng vé vượt sức chứa.
+    reported_ticket_rev = cap_constrained_ticket_rev if validation_status == "CAPACITY_EXCEEDED" else scenario_rev
+    reported_total_rev = (
+        cap_constrained_total_rev
+        if validation_status == "CAPACITY_EXCEEDED"
+        else (scenario_rev + baseline.fnb_revenue_clean)
+    )
+    reported_ticket_rev_delta = reported_ticket_rev - baseline.ticket_revenue_clean
+    reported_ticket_rev_delta_pct = (
+        (reported_ticket_rev_delta / baseline.ticket_revenue_clean)
+        if baseline.ticket_revenue_clean > 0
+        else None
+    )
 
     scenario_metrics = {
         "atp_clean": baseline.atp_clean,
         "ticket_qty_clean": scenario_qty,
+        "potential_ticket_qty": scenario_qty,
+        "aggregate_capacity_upper_bound": cap if (cap is not None and cap > 0) else None,
         "feasible_ticket_qty": feasible_qty,
         "unmet_demand_tickets": unmet_demand_tickets,
-        "ticket_revenue_clean": scenario_rev,
+        "ticket_revenue_clean": reported_ticket_rev,
+        "potential_ticket_revenue_clean": scenario_rev,
         "feasible_ticket_revenue_clean": feasible_rev,
+        "capacity_constrained_ticket_revenue_upper_bound": cap_constrained_ticket_rev,
         "fnb_revenue_clean": baseline.fnb_revenue_clean,
-        "total_revenue_clean": scenario_rev + baseline.fnb_revenue_clean,
+        "total_revenue_clean": reported_total_rev,
+        "potential_total_revenue_clean": scenario_rev + baseline.fnb_revenue_clean,
+        "capacity_constrained_total_revenue_upper_bound": cap_constrained_total_rev,
         "occupancy": scenario_occupancy,
         "raw_demand_capacity_ratio": (scenario_qty / cap) if (cap and cap > 0) else None,
         "attach_rate": baseline.attach_rate,
+        "sold_out_showtime_count": baseline.sold_out_showtime_count,
+        "capacity_check_scope": capacity_check_scope,
+        "operational_feasibility_status": operational_feasibility_status,
     }
     absolute_deltas = {
         "ticket_qty_delta": float(qty_delta),
-        "ticket_revenue_delta": rev_delta,
+        "feasible_ticket_qty_delta": float(feasible_qty - baseline.ticket_qty_clean),
+        "ticket_revenue_delta": reported_ticket_rev_delta,
+        "potential_ticket_revenue_delta": potential_rev_delta,
         "feasible_ticket_revenue_delta": feasible_rev - baseline.ticket_revenue_clean,
+        "capacity_constrained_ticket_revenue_delta": (
+            (cap_constrained_ticket_rev - baseline.ticket_revenue_clean)
+            if cap_constrained_ticket_rev is not None
+            else None
+        ),
         "fnb_revenue_delta": 0.0,
-        "total_revenue_delta": rev_delta,
+        "total_revenue_delta": reported_ticket_rev_delta,
+        "potential_total_revenue_delta": potential_rev_delta,
+        "capacity_constrained_total_revenue_delta": (
+            (cap_constrained_total_rev - (baseline.ticket_revenue_clean + baseline.fnb_revenue_clean))
+            if cap_constrained_total_rev is not None
+            else None
+        ),
     }
     percentage_deltas = {
         "ticket_qty_delta_pct": qty_delta_pct,
-        "ticket_revenue_delta_pct": rev_delta_pct,
+        "ticket_revenue_delta_pct": reported_ticket_rev_delta_pct,
+        "potential_ticket_revenue_delta_pct": potential_rev_delta_pct,
+        "capacity_constrained_ticket_revenue_delta_pct": (
+            ((cap_constrained_ticket_rev - baseline.ticket_revenue_clean) / baseline.ticket_revenue_clean)
+            if (cap_constrained_ticket_rev is not None and baseline.ticket_revenue_clean > 0)
+            else None
+        ),
         "fnb_revenue_delta_pct": 0.0,
     }
 
@@ -588,6 +669,8 @@ def simulate_ticket_volume_change(
         validation_status=validation_status,
         warnings=warnings,
         baseline_fingerprint=baseline.fingerprint,
+        capacity_check_scope=capacity_check_scope,
+        operational_feasibility_status=operational_feasibility_status,
     )
 
 
@@ -733,13 +816,21 @@ def compare_scenarios(
             "scenario_name": "Baseline (Thực tế lịch sử)",
             "scenario_type": "BASELINE",
             "ticket_revenue_clean": baseline.ticket_revenue_clean,
+            "potential_ticket_revenue_clean": baseline.ticket_revenue_clean,
+            "capacity_constrained_ticket_revenue_upper_bound": baseline.ticket_revenue_clean,
             "fnb_revenue_clean": baseline.fnb_revenue_clean,
             "total_revenue_clean": baseline.ticket_revenue_clean + baseline.fnb_revenue_clean,
+            "potential_total_revenue_clean": baseline.ticket_revenue_clean + baseline.fnb_revenue_clean,
             "revenue_delta_vnd": 0.0,
+            "potential_revenue_delta_vnd": 0.0,
             "revenue_delta_pct": 0.0,
             "ticket_qty_clean": baseline.ticket_qty_clean,
+            "feasible_ticket_qty": baseline.ticket_qty_clean,
+            "unmet_demand_tickets": 0,
             "occupancy": baseline.weighted_occupancy,
             "attach_rate": baseline.attach_rate,
+            "capacity_check_scope": "OBSERVED_HISTORICAL",
+            "operational_feasibility_status": "HISTORICAL_BASELINE",
             "validation_status": "HISTORICAL_BASELINE",
             "limitations_summary": "; ".join(baseline.limitations[:2]),
         }
@@ -757,7 +848,11 @@ def compare_scenarios(
         sm = sc.scenario_metrics
         base_total = baseline.ticket_revenue_clean + baseline.fnb_revenue_clean
         sc_total = float(sm.get("total_revenue_clean", base_total))
+        pot_ticket_rev = float(sm.get("potential_ticket_revenue_clean", sm.get("ticket_revenue_clean", baseline.ticket_revenue_clean)))
+        pot_total = float(sm.get("potential_total_revenue_clean", sc_total))
+        cap_upper_ticket = sm.get("capacity_constrained_ticket_revenue_upper_bound")
         delta_total = sc_total - base_total
+        pot_delta_total = pot_total - base_total
         delta_pct = (delta_total / base_total) if base_total > 0 else None
 
         rows.append(
@@ -766,13 +861,23 @@ def compare_scenarios(
                 "scenario_name": sc.scenario_name,
                 "scenario_type": sc.scenario_type,
                 "ticket_revenue_clean": float(sm.get("ticket_revenue_clean", baseline.ticket_revenue_clean)),
+                "potential_ticket_revenue_clean": pot_ticket_rev,
+                "capacity_constrained_ticket_revenue_upper_bound": (
+                    float(cap_upper_ticket) if cap_upper_ticket is not None else None
+                ),
                 "fnb_revenue_clean": float(sm.get("fnb_revenue_clean", baseline.fnb_revenue_clean)),
                 "total_revenue_clean": sc_total,
+                "potential_total_revenue_clean": pot_total,
                 "revenue_delta_vnd": delta_total,
+                "potential_revenue_delta_vnd": pot_delta_total,
                 "revenue_delta_pct": delta_pct,
                 "ticket_qty_clean": int(sm.get("ticket_qty_clean", baseline.ticket_qty_clean)),
+                "feasible_ticket_qty": int(sm.get("feasible_ticket_qty", sm.get("ticket_qty_clean", baseline.ticket_qty_clean))),
+                "unmet_demand_tickets": int(sm.get("unmet_demand_tickets", 0)),
                 "occupancy": sm.get("occupancy"),
                 "attach_rate": sm.get("attach_rate"),
+                "capacity_check_scope": sc.capacity_check_scope,
+                "operational_feasibility_status": sc.operational_feasibility_status,
                 "validation_status": sc.validation_status,
                 "limitations_summary": "; ".join(sc.limitations[:2]),
             }

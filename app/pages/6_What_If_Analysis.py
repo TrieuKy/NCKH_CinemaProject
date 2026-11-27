@@ -292,9 +292,9 @@ elif scenario_choice.startswith("Scenario B"):
             key="whatif_name_b",
         )
     notice(
-        "Kiểm soát sức chứa ở grain suất chiếu: sử dụng tổng ghế quan sát được "
+        "Kiểm soát sức chứa ở cấp tổng hợp (**AGGREGATE_CAPACITY_CHECK**): sử dụng tổng ghế quan sát được "
         f"({format_decimal(baseline.available_showtime_capacity, 0) if baseline.available_showtime_capacity else 'N/A'} ghế). "
-        "Không tự giả định mở thêm suất chiếu mới.",
+        "Chưa kiểm chứng khả thi vận hành theo từng suất chiếu (phim × phòng × giờ chiếu) và không tự giả định mở thêm suất.",
         type="info",
     )
     current_result = simulate_ticket_volume_change(
@@ -343,11 +343,17 @@ if current_result is not None:
     status_badge_level = (
         "success"
         if current_result.validation_status == "VALID"
-        else ("warning" if current_result.validation_status == "CAPACITY_EXCEEDED" else "error")
+        else ("warning" if current_result.validation_status in ("CAPACITY_EXCEEDED", "UNRECONCILED_BASELINE") else "error")
     )
+    scope_badge_html = ""
+    if current_result.scenario_type == "TICKET_VOLUME":
+        scope_badge_html = (
+            f" &nbsp; {badge(current_result.capacity_check_scope, level='info')}"
+            f" &nbsp; {badge(current_result.operational_feasibility_status, level='warning')}"
+        )
     st.markdown(
         f"{badge('HYPOTHETICAL SCENARIO', level='warning')} &nbsp; "
-        f"{badge(current_result.validation_status, level=status_badge_level)} &nbsp; "
+        f"{badge(current_result.validation_status, level=status_badge_level)}{scope_badge_html} &nbsp; "
         f"**Mã kịch bản:** `{current_result.scenario_id}` — **{current_result.scenario_name}**",
         unsafe_allow_html=True,
     )
@@ -363,17 +369,61 @@ if current_result is not None:
         pd_deltas = current_result.percentage_deltas
 
         base_total = baseline.ticket_revenue_clean + baseline.fnb_revenue_clean
+        is_cap_exceeded = current_result.validation_status == "CAPACITY_EXCEEDED"
         sc_total = float(sm.get("total_revenue_clean", base_total))
         total_delta = sc_total - base_total
         total_delta_pct = (total_delta / base_total) if base_total > 0 else 0.0
 
+        if is_cap_exceeded:
+            pot_qty = int(sm.get("potential_ticket_qty", sm.get("ticket_qty_clean", 0)))
+            agg_cap = int(sm.get("aggregate_capacity_upper_bound") or 0)
+            unmet_qty = int(sm.get("unmet_demand_tickets", 0))
+            pot_ticket_rev = float(sm.get("potential_ticket_revenue_clean", 0.0))
+            cap_ticket_rev = float(sm.get("capacity_constrained_ticket_revenue_upper_bound", 0.0))
+            pot_total_rev = float(sm.get("potential_total_revenue_clean", pot_ticket_rev + baseline.fnb_revenue_clean))
+            cap_total_rev = float(sm.get("capacity_constrained_total_revenue_upper_bound", cap_ticket_rev + baseline.fnb_revenue_clean))
+
+            st.error(
+                f"🚫 **VƯỢT SỨC CHỨA TỔNG HỢP (`CAPACITY_EXCEEDED`):** Nhu cầu vé giả định **{format_decimal(pot_qty, 0)} vé** "
+                f"vượt tổng công suất quan sát **{format_decimal(agg_cap, 0)} ghế** ({format_decimal(unmet_qty, 0)} vé không thể đáp ứng). "
+                f"Doanh thu vé tiềm năng **{format_currency(pot_ticket_rev)}** KHÔNG phải doanh thu có thể bán hết; "
+                f"giới hạn trên doanh thu vé theo sức chứa là **{format_currency(cap_ticket_rev)}**."
+            )
+
+            cap_cols = st.columns(5)
+            with cap_cols[0]:
+                kpi_card("Nhu cầu vé giả định", f"{format_decimal(pot_qty, 0)} vé")
+            with cap_cols[1]:
+                kpi_card("Tổng công suất quan sát", f"{format_decimal(agg_cap, 0)} ghế")
+            with cap_cols[2]:
+                kpi_card("Số vé vượt sức chứa", f"{format_decimal(unmet_qty, 0)} vé")
+            with cap_cols[3]:
+                kpi_card(
+                    "DT vé tiềm năng (Nhu cầu)",
+                    format_currency(pot_ticket_rev, compact=True),
+                    delta=f"{format_currency(ad.get('potential_ticket_revenue_delta', 0), compact=True)} ({format_percent(pd_deltas.get('potential_ticket_revenue_delta_pct', 0))})",
+                )
+            with cap_cols[4]:
+                kpi_card(
+                    "Giới hạn trên DT vé (Sức chứa)",
+                    format_currency(cap_ticket_rev, compact=True),
+                    delta=f"{format_currency(ad.get('capacity_constrained_ticket_revenue_delta', 0), compact=True)} ({format_percent(pd_deltas.get('capacity_constrained_ticket_revenue_delta_pct', 0))})",
+                )
+
         r_cols = st.columns(4)
         with r_cols[0]:
-            kpi_card(
-                "Doanh thu vé mô phỏng",
-                format_currency(sm.get("ticket_revenue_clean"), compact=True),
-                delta=f"{format_currency(ad.get('ticket_revenue_delta', 0), compact=True)} ({format_percent(pd_deltas.get('ticket_revenue_delta_pct', 0))})",
-            )
+            if is_cap_exceeded:
+                kpi_card(
+                    "Giới hạn trên DT vé theo sức chứa",
+                    format_currency(sm.get("capacity_constrained_ticket_revenue_upper_bound"), compact=True),
+                    delta=f"{format_currency(ad.get('capacity_constrained_ticket_revenue_delta', 0), compact=True)} ({format_percent(pd_deltas.get('capacity_constrained_ticket_revenue_delta_pct', 0))})",
+                )
+            else:
+                kpi_card(
+                    "Doanh thu vé mô phỏng",
+                    format_currency(sm.get("ticket_revenue_clean"), compact=True),
+                    delta=f"{format_currency(ad.get('ticket_revenue_delta', 0), compact=True)} ({format_percent(pd_deltas.get('ticket_revenue_delta_pct', 0))})",
+                )
         with r_cols[1]:
             kpi_card(
                 "Doanh thu F&B mô phỏng",
@@ -381,8 +431,13 @@ if current_result is not None:
                 delta=f"{format_currency(ad.get('fnb_revenue_delta', 0), compact=True)} ({format_percent(pd_deltas.get('fnb_revenue_delta_pct', 0))})",
             )
         with r_cols[2]:
+            total_label = (
+                "Giới hạn trên Tổng DT (theo sức chứa)"
+                if is_cap_exceeded
+                else "Tổng doanh thu giả định"
+            )
             kpi_card(
-                "Tổng doanh thu giả định",
+                total_label,
                 format_currency(sc_total, compact=True),
                 delta=f"{format_currency(total_delta, compact=True)} ({format_percent(total_delta_pct)})",
             )
@@ -390,11 +445,11 @@ if current_result is not None:
             if current_result.scenario_type == "TICKET_VOLUME":
                 occ_val = sm.get("occupancy")
                 kpi_card(
-                    "Occupancy mô phỏng",
+                    "Occupancy (Aggregate Check)",
                     format_percent(occ_val) if occ_val is not None else "N/A",
-                    delta=f"Không đáp ứng: {format_decimal(sm.get('unmet_demand_tickets', 0), 0)} vé"
+                    delta=f"Vượt sức chứa: {format_decimal(sm.get('unmet_demand_tickets', 0), 0)} vé"
                     if sm.get("unmet_demand_tickets", 0) > 0
-                    else "Trong giới hạn sức chứa",
+                    else "Trong giới hạn sức chứa tổng hợp",
                 )
             elif current_result.scenario_type == "TICKET_PRICE":
                 kpi_card(
@@ -410,8 +465,37 @@ if current_result is not None:
                 )
 
         # Biểu đồ so sánh Baseline vs Scenario
-        fig = go.Figure(
-            data=[
+        if is_cap_exceeded:
+            bar_traces = [
+                go.Bar(
+                    name="Historical Baseline",
+                    x=["Doanh thu vé", "Doanh thu F&B", "Tổng doanh thu"],
+                    y=[baseline.ticket_revenue_clean, baseline.fnb_revenue_clean, base_total],
+                    marker_color="#64748B",
+                ),
+                go.Bar(
+                    name="Giới hạn trên theo sức chứa (Upper Bound)",
+                    x=["Doanh thu vé", "Doanh thu F&B", "Tổng doanh thu"],
+                    y=[
+                        float(sm.get("capacity_constrained_ticket_revenue_upper_bound", 0.0)),
+                        float(sm.get("fnb_revenue_clean", baseline.fnb_revenue_clean)),
+                        float(sm.get("capacity_constrained_total_revenue_upper_bound", sc_total)),
+                    ],
+                    marker_color=COLOR_PRIMARY,
+                ),
+                go.Bar(
+                    name="Tiềm năng nhu cầu (Chưa kiểm chứng sức chứa)",
+                    x=["Doanh thu vé", "Doanh thu F&B", "Tổng doanh thu"],
+                    y=[
+                        float(sm.get("potential_ticket_revenue_clean", 0.0)),
+                        float(sm.get("fnb_revenue_clean", baseline.fnb_revenue_clean)),
+                        float(sm.get("potential_total_revenue_clean", sc_total)),
+                    ],
+                    marker_color="#F59E0B",
+                ),
+            ]
+        else:
+            bar_traces = [
                 go.Bar(
                     name="Historical Baseline",
                     x=["Doanh thu vé", "Doanh thu F&B", "Tổng doanh thu"],
@@ -429,7 +513,8 @@ if current_result is not None:
                     marker_color=COLOR_PRIMARY,
                 ),
             ]
-        )
+
+        fig = go.Figure(data=bar_traces)
         fig.update_layout(
             barmode="group",
             title="So sánh Doanh thu: Historical Baseline vs Hypothetical Scenario",
@@ -440,29 +525,71 @@ if current_result is not None:
         st.plotly_chart(fig, use_container_width=True)
 
         # Bảng giải thích phép tính
-        calc_rows = [
-            {
-                "Chỉ số": "Doanh thu vé (Clean)",
-                "Baseline": format_currency(baseline.ticket_revenue_clean),
-                "Mô phỏng": format_currency(sm.get("ticket_revenue_clean")),
-                "Chênh lệch (VND)": format_currency(ad.get("ticket_revenue_delta", 0)),
-                "Chênh lệch (%)": format_percent(pd_deltas.get("ticket_revenue_delta_pct", 0)),
-            },
-            {
-                "Chỉ số": "Doanh thu F&B (Clean)",
-                "Baseline": format_currency(baseline.fnb_revenue_clean),
-                "Mô phỏng": format_currency(sm.get("fnb_revenue_clean")),
-                "Chênh lệch (VND)": format_currency(ad.get("fnb_revenue_delta", 0)),
-                "Chênh lệch (%)": format_percent(pd_deltas.get("fnb_revenue_delta_pct", 0)),
-            },
-            {
-                "Chỉ số": "Số vé bán (Clean)",
-                "Baseline": format_decimal(baseline.ticket_qty_clean, 0),
-                "Mô phỏng": format_decimal(sm.get("ticket_qty_clean"), 0),
-                "Chênh lệch (VND)": format_decimal(ad.get("ticket_qty_delta", 0), 0),
-                "Chênh lệch (%)": format_percent(pd_deltas.get("ticket_qty_delta_pct", 0)),
-            },
-        ]
+        if is_cap_exceeded:
+            calc_rows = [
+                {
+                    "Chỉ số": "Doanh thu vé tiềm năng (Nhu cầu giả định)",
+                    "Baseline": format_currency(baseline.ticket_revenue_clean),
+                    "Mô phỏng": format_currency(sm.get("potential_ticket_revenue_clean")),
+                    "Chênh lệch (VND)": format_currency(ad.get("potential_ticket_revenue_delta", 0)),
+                    "Chênh lệch (%)": format_percent(pd_deltas.get("potential_ticket_revenue_delta_pct", 0)),
+                },
+                {
+                    "Chỉ số": "Giới hạn trên doanh thu vé theo sức chứa",
+                    "Baseline": format_currency(baseline.ticket_revenue_clean),
+                    "Mô phỏng": format_currency(sm.get("capacity_constrained_ticket_revenue_upper_bound")),
+                    "Chênh lệch (VND)": format_currency(ad.get("capacity_constrained_ticket_revenue_delta", 0)),
+                    "Chênh lệch (%)": format_percent(pd_deltas.get("capacity_constrained_ticket_revenue_delta_pct", 0)),
+                },
+                {
+                    "Chỉ số": "Doanh thu F&B (Clean)",
+                    "Baseline": format_currency(baseline.fnb_revenue_clean),
+                    "Mô phỏng": format_currency(sm.get("fnb_revenue_clean")),
+                    "Chênh lệch (VND)": format_currency(ad.get("fnb_revenue_delta", 0)),
+                    "Chênh lệch (%)": format_percent(pd_deltas.get("fnb_revenue_delta_pct", 0)),
+                },
+                {
+                    "Chỉ số": "Nhu cầu vé giả định (vé)",
+                    "Baseline": format_decimal(baseline.ticket_qty_clean, 0),
+                    "Mô phỏng": format_decimal(sm.get("potential_ticket_qty"), 0),
+                    "Chênh lệch (VND)": format_decimal(ad.get("ticket_qty_delta", 0), 0),
+                    "Chênh lệch (%)": format_percent(pd_deltas.get("ticket_qty_delta_pct", 0)),
+                },
+                {
+                    "Chỉ số": "Số vé tối đa theo công suất tổng hợp (vé)",
+                    "Baseline": format_decimal(baseline.ticket_qty_clean, 0),
+                    "Mô phỏng": format_decimal(sm.get("feasible_ticket_qty"), 0),
+                    "Chênh lệch (VND)": format_decimal(ad.get("feasible_ticket_qty_delta", 0), 0),
+                    "Chênh lệch (%)": format_percent(
+                        (ad.get("feasible_ticket_qty_delta", 0) / baseline.ticket_qty_clean)
+                        if baseline.ticket_qty_clean > 0 else 0.0
+                    ),
+                },
+            ]
+        else:
+            calc_rows = [
+                {
+                    "Chỉ số": "Doanh thu vé (Clean)",
+                    "Baseline": format_currency(baseline.ticket_revenue_clean),
+                    "Mô phỏng": format_currency(sm.get("ticket_revenue_clean")),
+                    "Chênh lệch (VND)": format_currency(ad.get("ticket_revenue_delta", 0)),
+                    "Chênh lệch (%)": format_percent(pd_deltas.get("ticket_revenue_delta_pct", 0)),
+                },
+                {
+                    "Chỉ số": "Doanh thu F&B (Clean)",
+                    "Baseline": format_currency(baseline.fnb_revenue_clean),
+                    "Mô phỏng": format_currency(sm.get("fnb_revenue_clean")),
+                    "Chênh lệch (VND)": format_currency(ad.get("fnb_revenue_delta", 0)),
+                    "Chênh lệch (%)": format_percent(pd_deltas.get("fnb_revenue_delta_pct", 0)),
+                },
+                {
+                    "Chỉ số": "Số vé bán (Clean)",
+                    "Baseline": format_decimal(baseline.ticket_qty_clean, 0),
+                    "Mô phỏng": format_decimal(sm.get("ticket_qty_clean"), 0),
+                    "Chênh lệch (VND)": format_decimal(ad.get("ticket_qty_delta", 0), 0),
+                    "Chênh lệch (%)": format_percent(pd_deltas.get("ticket_qty_delta_pct", 0)),
+                },
+            ]
         st.dataframe(pd.DataFrame(calc_rows), use_container_width=True, hide_index=True)
 
         # Nút lưu vào session để so sánh
@@ -504,14 +631,17 @@ else:
             "Mã": comp_df["scenario_id"],
             "Tên kịch bản": comp_df["scenario_name"],
             "Loại": comp_df["scenario_type"],
-            "Doanh thu vé": comp_df["ticket_revenue_clean"].map(lambda v: format_currency(v)),
+            "DT vé (Tiềm năng)": comp_df["potential_ticket_revenue_clean"].map(lambda v: format_currency(v)),
+            "DT vé (Giới hạn trên sức chứa / Thực hiện)": comp_df["ticket_revenue_clean"].map(lambda v: format_currency(v)),
             "Doanh thu F&B": comp_df["fnb_revenue_clean"].map(lambda v: format_currency(v)),
-            "Tổng doanh thu giả định": comp_df["total_revenue_clean"].map(lambda v: format_currency(v)),
-            "Chênh lệch (VND)": comp_df["revenue_delta_vnd"].map(lambda v: format_currency(v)),
+            "Tổng DT (Giới hạn trên / Mô phỏng)": comp_df["total_revenue_clean"].map(lambda v: format_currency(v)),
+            "Chênh lệch Tổng DT (VND)": comp_df["revenue_delta_vnd"].map(lambda v: format_currency(v)),
             "Chênh lệch (%)": comp_df["revenue_delta_pct"].map(lambda v: format_percent(v)),
-            "Số vé": comp_df["ticket_qty_clean"].map(lambda v: format_decimal(v, 0)),
+            "Nhu cầu vé": comp_df["ticket_qty_clean"].map(lambda v: format_decimal(v, 0)),
+            "Vé vượt sức chứa": comp_df["unmet_demand_tickets"].map(lambda v: format_decimal(v, 0)),
             "Occupancy": comp_df["occupancy"].map(lambda v: format_percent(v) if pd.notna(v) else "N/A"),
             "Attach Rate": comp_df["attach_rate"].map(lambda v: format_percent(v) if pd.notna(v) else "N/A"),
+            "Phạm vi kiểm tra sức chứa": comp_df["capacity_check_scope"],
             "Trạng thái": comp_df["validation_status"],
         })
         st.dataframe(display_df, use_container_width=True, hide_index=True)
@@ -532,7 +662,7 @@ else:
                 ]
             )
             fig_cmp.update_layout(
-                title="Chênh lệch doanh thu giả định so với Baseline (VND)",
+                title="Chênh lệch Tổng doanh thu (theo giới hạn sức chứa nếu vượt capacity) so với Baseline (VND)",
                 yaxis_title="Chênh lệch (VND)",
                 height=320,
             )
@@ -542,9 +672,12 @@ else:
         # Xuất CSV (tuyệt đối không chứa thông tin tài khoản người dùng)
         export_cols = [
             "scenario_id", "scenario_name", "scenario_type",
-            "ticket_revenue_clean", "fnb_revenue_clean", "total_revenue_clean",
-            "revenue_delta_vnd", "revenue_delta_pct",
-            "ticket_qty_clean", "occupancy", "attach_rate", "validation_status",
+            "potential_ticket_revenue_clean", "ticket_revenue_clean", "fnb_revenue_clean",
+            "potential_total_revenue_clean", "total_revenue_clean",
+            "revenue_delta_vnd", "potential_revenue_delta_vnd", "revenue_delta_pct",
+            "ticket_qty_clean", "feasible_ticket_qty", "unmet_demand_tickets",
+            "occupancy", "attach_rate", "capacity_check_scope",
+            "operational_feasibility_status", "validation_status",
         ]
         csv_bytes = comp_df[export_cols].to_csv(index=False).encode("utf-8-sig")
         st.download_button(

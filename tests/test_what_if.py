@@ -59,6 +59,8 @@ def _sample_baseline(
     available_showtime_capacity: int | None = 1500,
     ticket_txn_count: int = 500,
     fnb_txn_count: int = 200,
+    sold_out_showtime_count: int = 0,
+    capacity_reconciled: bool = True,
 ) -> BaselineMetrics:
     atp = (ticket_revenue_clean / ticket_qty_clean) if ticket_qty_clean > 0 else None
     occ = (
@@ -95,6 +97,8 @@ def _sample_baseline(
             "Không có dữ liệu chi phí nên không tính lợi nhuận/margin.",
             "Không sử dụng forecast đã hết hạn.",
         ),
+        sold_out_showtime_count=sold_out_showtime_count,
+        capacity_reconciled=capacity_reconciled,
     )
 
 
@@ -145,15 +149,82 @@ class TestWhatIfNumericCorrectness:
         assert res_down.scenario_metrics["occupancy"] == pytest.approx(850 / 1500)
 
     def test_volume_exceeding_capacity_detected_and_capped(self):
-        base = _sample_baseline(ticket_qty_clean=1000, available_showtime_capacity=1200)
+        base = _sample_baseline(
+            ticket_qty_clean=1000,
+            ticket_revenue_clean=100_000_000.0,
+            fnb_revenue_clean=30_000_000.0,
+            available_showtime_capacity=1200,
+        )
         res = simulate_ticket_volume_change(base, 0.50)  # 1500 > 1200
         assert res.validation_status == "CAPACITY_EXCEEDED"
+        assert res.capacity_check_scope == "AGGREGATE_CAPACITY_CHECK"
+        assert res.operational_feasibility_status == "CAPACITY_EXCEEDED_AGGREGATE"
         assert res.scenario_metrics["ticket_qty_clean"] == 1500
+        assert res.scenario_metrics["potential_ticket_qty"] == 1500
+        assert res.scenario_metrics["aggregate_capacity_upper_bound"] == 1200
         assert res.scenario_metrics["feasible_ticket_qty"] == 1200
         assert res.scenario_metrics["unmet_demand_tickets"] == 300
+        assert res.scenario_metrics["potential_ticket_revenue_clean"] == pytest.approx(150_000_000.0)
         assert res.scenario_metrics["feasible_ticket_revenue_clean"] == pytest.approx(120_000_000.0)
+        assert res.scenario_metrics["capacity_constrained_ticket_revenue_upper_bound"] == pytest.approx(120_000_000.0)
+        # total_revenue_clean MUST NOT include unmet demand revenue (180M); must be capped at 150M (120M + 30M)
+        assert res.scenario_metrics["total_revenue_clean"] == pytest.approx(150_000_000.0)
+        assert res.scenario_metrics["potential_total_revenue_clean"] == pytest.approx(180_000_000.0)
+        assert res.scenario_metrics["capacity_constrained_total_revenue_upper_bound"] == pytest.approx(150_000_000.0)
+        assert res.absolute_deltas["potential_ticket_revenue_delta"] == pytest.approx(50_000_000.0)
+        assert res.absolute_deltas["capacity_constrained_ticket_revenue_delta"] == pytest.approx(20_000_000.0)
         assert res.scenario_metrics["occupancy"] == pytest.approx(1.0)
         assert any("VƯỢT SỨC CHỨA" in w for w in res.warnings)
+
+    def test_volume_within_capacity_is_aggregate_only_not_operationally_feasible(self):
+        base = _sample_baseline(ticket_qty_clean=1000, available_showtime_capacity=1500)
+        res = simulate_ticket_volume_change(base, 0.20)
+        assert res.validation_status == "VALID"
+        assert res.capacity_check_scope == "AGGREGATE_CAPACITY_CHECK"
+        assert res.operational_feasibility_status == "UNVERIFIED_AT_SHOWTIME_GRAIN"
+        assert res.operational_feasibility_status != "OPERATIONALLY_FEASIBLE"
+        assert any("AGGREGATE_CAPACITY_CHECK" in lim for lim in res.limitations)
+
+    def test_sold_out_showtime_warning_even_when_aggregate_capacity_available(self):
+        base = _sample_baseline(
+            ticket_qty_clean=1000,
+            available_showtime_capacity=1500,
+            sold_out_showtime_count=3,
+        )
+        # Replicate fetch_baseline_from_db warning for sold-out showtimes
+        base_with_warn = BaselineMetrics(
+            **{
+                **{k: getattr(base, k) for k in base.__dataclass_fields__},
+                "warnings": (
+                    "Có 3/15 suất chiếu đã đạt hoặc vượt 100% sức chứa trong kỳ baseline; "
+                    "ghế trống ở suất khác không tự động đáp ứng cho suất đã bán hết.",
+                ),
+            }
+        )
+        res = simulate_ticket_volume_change(base_with_warn, 0.10)
+        assert res.validation_status == "VALID"
+        assert res.scenario_metrics["sold_out_showtime_count"] == 3
+        assert any("bán hết" in w.lower() for w in res.warnings)
+
+    def test_compare_scenarios_separates_potential_and_constrained_revenue(self):
+        base = _sample_baseline(
+            ticket_qty_clean=1000,
+            ticket_revenue_clean=100_000_000.0,
+            fnb_revenue_clean=30_000_000.0,
+            available_showtime_capacity=1200,
+        )
+        sc_a = simulate_ticket_price_change(base, 0.10)
+        sc_b = simulate_ticket_volume_change(base, 0.50)  # 1500 > 1200
+        sc_c = simulate_fnb_attach_rate(base, 0.50)
+        rows = compare_scenarios(base, [sc_a, sc_b, sc_c])
+        row_b = next(r for r in rows if r["scenario_type"] == "TICKET_VOLUME")
+        assert row_b["potential_ticket_revenue_clean"] == pytest.approx(150_000_000.0)
+        assert row_b["capacity_constrained_ticket_revenue_upper_bound"] == pytest.approx(120_000_000.0)
+        assert row_b["ticket_revenue_clean"] == pytest.approx(120_000_000.0)
+        assert row_b["total_revenue_clean"] == pytest.approx(150_000_000.0)
+        assert row_b["potential_total_revenue_clean"] == pytest.approx(180_000_000.0)
+        assert row_b["unmet_demand_tickets"] == 300
+        assert row_b["validation_status"] == "CAPACITY_EXCEEDED"
 
     def test_missing_capacity_does_not_compute_fake_occupancy(self):
         base = _sample_baseline(available_showtime_capacity=None)
@@ -341,6 +412,45 @@ class TestWhatIfPostgreSQLIntegration:
             after_count = conn.execute(text("SELECT COUNT(*) FROM cinema_dw.whatif_run")).scalar()
         assert after_count == before_count
 
+    def test_reconcile_clean_ticket_qty_and_fnb_across_sources(self):
+        from etl.db import get_engine
+        from sqlalchemy import text
+
+        eng = get_engine()
+        with eng.connect() as conn:
+            kpi_rows = conn.execute(text("""
+                SELECT cinema_key, SUM(ticket_qty_clean)::bigint AS qty, SUM(fnb_revenue_clean)::numeric AS frev
+                FROM cinema_dw.vw_daily_kpi
+                WHERE date_key BETWEEN 20251001 AND 20260930
+                GROUP BY cinema_key ORDER BY cinema_key
+            """)).fetchall()
+            occ_rows = conn.execute(text("""
+                SELECT dc.cinema_key, SUM(o.qty_clean)::bigint AS qty
+                FROM cinema_dw.vw_showtime_occupancy o
+                JOIN cinema_dw.dim_cinema dc ON o.cinema_name = dc.cinema_name
+                WHERE o.date_key BETWEEN 20251001 AND 20260930
+                GROUP BY dc.cinema_key ORDER BY dc.cinema_key
+            """)).fetchall()
+            fact_rows = conn.execute(text("""
+                SELECT cinema_key, SUM(CASE WHEN is_anomaly=0 THEN qty ELSE 0 END)::bigint AS qty
+                FROM cinema_dw.fact_ticket
+                WHERE date_key BETWEEN 20251001 AND 20260930
+                GROUP BY cinema_key ORDER BY cinema_key
+            """)).fetchall()
+            attach_rows = conn.execute(text("""
+                SELECT cinema_key, SUM(fnb_revenue_clean)::numeric AS frev
+                FROM cinema_dw.vw_fnb_attach
+                WHERE date_key BETWEEN 20251001 AND 20260930
+                GROUP BY cinema_key ORDER BY cinema_key
+            """)).fetchall()
+
+        assert [(r[0], int(r[1])) for r in kpi_rows] == [(r[0], int(r[1])) for r in occ_rows]
+        assert [(r[0], int(r[1])) for r in kpi_rows] == [(r[0], int(r[1])) for r in fact_rows]
+        assert sum(int(r[1]) for r in kpi_rows) == 805_664
+        assert [(r[0], float(r[2])) for r in kpi_rows] == pytest.approx(
+            [(r[0], float(r[1])) for r in attach_rows]
+        )
+
 
 # =============================================================================
 # 5. STREAMLIT APPTEST UI VALIDATION
@@ -429,3 +539,31 @@ class TestWhatIfAppTest:
             # Change cinema -> old scenarios must be cleared
             at.selectbox(key="whatif_cinema_sel").set_value("CGV Vincom Đồng Khởi (CN02)").run(timeout=15)
             assert len(at.session_state["whatif_scenarios"]) == 0
+
+    def test_manager_capacity_exceeded_displays_separate_revenues_and_warning(self):
+        from streamlit.testing.v1 import AppTest
+
+        base = _sample_baseline(
+            cinema_key=1,
+            ticket_qty_clean=1000,
+            ticket_revenue_clean=100_000_000.0,
+            fnb_revenue_clean=30_000_000.0,
+            available_showtime_capacity=1200,
+        )
+        at = AppTest.from_file(str(ROOT / "app" / "pages" / "6_What_If_Analysis.py"))
+        self._set_user(at, role="MANAGER", username="mgr1")
+
+        with patch("app.data_access.load_data_date_range", return_value=(date(2025, 10, 1), date(2026, 9, 30))), \
+             patch("app.data_access.load_what_if_baseline", return_value={"status": "OK", "baseline": base}), \
+             patch("streamlit.page_link"):
+            at.run(timeout=15)
+            at.radio(key="whatif_scenario_type").set_value(
+                "Scenario B — Thay đổi Lượng vé & Sức chứa (Ticket Volume & Capacity)"
+            ).run(timeout=15)
+            at.slider(key="whatif_qty_pct").set_value(50).run(timeout=15)
+
+        assert not at.exception
+        assert any("CAPACITY_EXCEEDED" in e.value for e in at.error)
+        assert any("300" in e.value for e in at.error)
+        assert any("120.000.000" in e.value for e in at.error)
+        assert any("150.000.000" in e.value for e in at.error)
