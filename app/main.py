@@ -234,24 +234,28 @@ def render_login_screen() -> None:
                         with st.spinner("Đang xác thực tài khoản..."):
                             user = authenticate_user(username, password)
 
-                            # Hỗ trợ tài khoản demo dự phòng nếu cơ sở dữ liệu chưa có người dùng
-                            if not user:
-                                if username == "manager" and password == "manager123":
-                                    user = {
+                            # Chế độ DEMO: chỉ bật khi biến môi trường CINEMA_DEMO_MODE=1
+                            # KHÔNG được kích hoạt mặc định trong vận hành.
+                            import os as _os
+                            _demo_mode = _os.environ.get("CINEMA_DEMO_MODE", "0").strip() == "1"
+                            if not user and _demo_mode:
+                                _DEMO_USERS = {
+                                    ("manager", "manager123"): {
                                         "user_id": "demo-manager-uuid",
                                         "username": "manager",
                                         "role": "MANAGER",
                                         "cinema_key": None,
                                         "login_time": datetime.now(),
-                                    }
-                                elif username == "staff" and password == "staff123":
-                                    user = {
+                                    },
+                                    ("staff", "staff123"): {
                                         "user_id": "demo-staff-uuid",
                                         "username": "staff",
                                         "role": "STAFF",
                                         "cinema_key": 1,
                                         "login_time": datetime.now(),
-                                    }
+                                    },
+                                }
+                                user = _DEMO_USERS.get((username, password))
 
                             if user:
                                 login_user(user)
@@ -260,18 +264,32 @@ def render_login_screen() -> None:
                             else:
                                 st.error("❌ Tên đăng nhập hoặc mật khẩu không chính xác.")
 
-        # Thông tin trợ giúp tài khoản mẫu
-        st.markdown(
-            """
-            <div style="margin-top:20px; padding:12px 14px; background:#F8FAFC; border:1px dashed #CBD5E1; border-radius:8px; font-size:12px; color:#64748B;">
-                <strong>💡 Tài khoản mẫu để kiểm thử nhanh:</strong><br>
-                • Quản lý tổng: <code>manager</code> / <code>manager123</code> (Vai trò: MANAGER)<br>
-                • Nhân viên rạp: <code>staff</code> / <code>staff123</code> (Vai trò: STAFF - Rạp Landmark 81)<br>
-                <em>(Hệ thống cũng hỗ trợ tài khoản thật tạo từ <code>python etl/create_user.py</code>)</em>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        # Thông tin hướng dẫn đăng nhập
+        import os as _os2
+        _demo_mode_ui = _os2.environ.get("CINEMA_DEMO_MODE", "0").strip() == "1"
+        if _demo_mode_ui:
+            st.markdown(
+                """
+                <div style="margin-top:20px; padding:12px 14px; background:#FFFBEB; border:1px dashed #FDE68A; border-radius:8px; font-size:12px; color:#92400E;">
+                    <strong>⚠️ Chế độ DEMO đang bật (CINEMA_DEMO_MODE=1):</strong><br>
+                    • Quản lý tổng: <code>manager</code> / <code>manager123</code> (Vai trò: MANAGER)<br>
+                    • Nhân viên rạp: <code>staff</code> / <code>staff123</code> (Vai trò: STAFF - Rạp Landmark 81)<br>
+                    <em>Chế độ demo chỉ dùng cho nghiên cứu — tắt biến môi trường khi vận hành thật.</em>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                """
+                <div style="margin-top:20px; padding:12px 14px; background:#F8FAFC; border:1px dashed #CBD5E1; border-radius:8px; font-size:12px; color:#64748B;">
+                    <strong>💡 Đăng nhập bằng tài khoản PostgreSQL:</strong><br>
+                    Tạo tài khoản bằng lệnh: <code>python etl/create_user.py</code><br>
+                    <em>Nếu chưa có cơ sở dữ liệu, liên hệ quản trị viên hệ thống.</em>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
 
 # =============================================================================
@@ -325,32 +343,19 @@ def render_sidebar_navigation(user: dict[str, Any]) -> None:
         st.markdown("---")
         st.markdown("### 📌 Menu nghiệp vụ")
 
-        # Điều hướng danh mục theo vai trò (Mục 3.2)
+        # Điều hướng danh mục theo vai trò (Task 10)
         if role == "STAFF":
             st.caption("CHỨC NĂNG NHÂN VIÊN RẠP (STAFF)")
-            st.markdown(
-                """
-                - 📝 **Nhập liệu suất chiếu** (`fact_showtime_summary`)
-                - 🍿 **Nhập liệu bắp nước** (`fact_daily_cinema_summary`)
-                - 📋 **Nhật ký tải lên** (`import_log`)
-                - 🧩 [**Thư viện thành phần**](Thu_vien_thanh_phan) *(Duyệt UI)*
-                """
-            )
+            st.page_link("pages/4_Review_Analytics.py", label="📝 Review Analytics", icon="⭐")
+            st.page_link("pages/0_Thu_vien_thanh_phan.py", label="🧩 Thư viện thành phần", icon="🎨")
         else:
             st.caption("CHỨC NĂNG BAN QUẢN LÝ (MANAGER)")
-            st.markdown(
-                """
-                - 📊 **Tổng quan KPI vận hành** (UC01)
-                - 👥 **Phân khúc khách hàng RFM** (UC02)
-                - 🍿 **Phân tích F&B & Giỏ hàng** (UC03)
-                - 📈 **Dự báo vé & Doanh thu** (UC04)
-                - ⚠️ **Cảnh báo bất thường** (UC05)
-                - 💡 **Đề xuất vận hành** (UC06)
-                - 🎯 **Mô phỏng What-If** (UC07)
-                - 🗄️ **Nhật ký ETL & Đối soát** (UC09)
-                - 🧩 [**Thư viện thành phần**](Thu_vien_thanh_phan) *(Duyệt UI)*
-                """
-            )
+            st.page_link("pages/1_KPI_Dashboard.py",    label="📊 Tổng quan KPI vận hành",   icon="📊")
+            st.page_link("pages/2_RFM_Segmentation.py", label="👥 Phân khúc khách hàng RFM", icon="👥")
+            st.page_link("pages/3_Forecasting.py",      label="📈 Dự báo nhu cầu vé",        icon="📈")
+            st.page_link("pages/4_Review_Analytics.py", label="⭐ Review Analytics",          icon="⭐")
+            st.page_link("pages/5_DSS_Dashboard.py",    label="💡 DSS Recommendations",       icon="💡")
+            st.page_link("pages/0_Thu_vien_thanh_phan.py", label="🧩 Thư viện thành phần",   icon="🎨")
 
         st.markdown("---")
         st.caption("🎬 Đề tài NCKH Sinh viên HUTECH")
@@ -374,26 +379,47 @@ def render_home_page(user: dict[str, Any]) -> None:
         icon="👋",
     )
 
+    # Trạng thái kết nối DB
+    try:
+        from app.data_access import check_db_connection
+        db_ok, db_msg = check_db_connection()
+        if db_ok:
+            notice("✅ Đã kết nối PostgreSQL cinema_dw thành công.", type="success")
+        else:
+            notice(f"⚠️ Chưa kết nối được PostgreSQL: {db_msg}. Một số trang sẽ hiển thị dữ liệu trống.", type="warning")
+    except Exception:
+        notice("⚠️ Không thể kiểm tra kết nối PostgreSQL.", type="warning")
+
     notice(
-        "Giai đoạn UI-1: Đã hoàn thiện toàn bộ **nền tảng giao diện Streamlit** "
-        "(Theme, Format, Charts, Components, Auth, Phân quyền). "
-        "Hãy truy cập trang **Thư viện thành phần** để duyệt toàn bộ linh kiện giao diện với dữ liệu cố định minh họa.",
+        "Task 10 — Dashboard đã tích hợp dữ liệu thực từ PostgreSQL. "
+        "Chọn trang nghiệp vụ từ sidebar để xem dữ liệu.",
         type="info",
     )
 
-    # Nút dẫn nhanh tới Thư viện thành phần
-    col_act1, col_act2 = st.columns([1, 2])
-    with col_act1:
-        st.page_link(
-            "pages/0_Thu_vien_thanh_phan.py",
-            label="🧩 Mở Thư Viện Thành Phần",
-            icon="✨",
-        )
+    # Các nút điều hướng nhanh theo vai trò
+    if role == "MANAGER":
+        st.markdown("#### 🚀 Truy cập nhanh:")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        with c1:
+            st.page_link("pages/1_KPI_Dashboard.py",    label="📊 KPI Dashboard")
+        with c2:
+            st.page_link("pages/2_RFM_Segmentation.py", label="👥 RFM Segments")
+        with c3:
+            st.page_link("pages/3_Forecasting.py",      label="📈 Forecasting")
+        with c4:
+            st.page_link("pages/4_Review_Analytics.py", label="⭐ Reviews")
+        with c5:
+            st.page_link("pages/5_DSS_Dashboard.py",    label="💡 DSS")
+    else:
+        st.markdown("#### 🚀 Truy cập nhanh:")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.page_link("pages/4_Review_Analytics.py", label="⭐ Review Analytics")
+        with c2:
+            st.page_link("pages/0_Thu_vien_thanh_phan.py", label="🧩 Thư viện thành phần")
 
     st.markdown("---")
-
-    # Hiển thị thử nghiệm thanh bộ lọc chuẩn Mục 3.3
-    st.markdown("#### 🛠️ Trải nghiệm thanh bộ lọc chuẩn (Mục 3.3):")
+    st.markdown("#### 🛠️ Trải nghiệm thanh bộ lọc chuẩn:")
     filters = render_standard_filters(
         user_role=role,
         fixed_cinema_key=cinema_key,
