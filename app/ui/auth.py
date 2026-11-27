@@ -243,7 +243,7 @@ def clear_sensitive_session_state() -> None:
         if key in st.session_state:
             del st.session_state[key]
     for key in list(st.session_state.keys()):
-        if isinstance(key, str) and key.startswith(("dss_", "rev_", "kpi_", "fc_")):
+        if isinstance(key, str) and key.startswith(("dss_", "rev_", "kpi_", "fc_", "whatif_")):
             del st.session_state[key]
 
 

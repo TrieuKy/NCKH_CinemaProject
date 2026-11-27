@@ -343,6 +343,7 @@ def render_sidebar_navigation(user: dict[str, Any]) -> None:
             st.page_link("pages/3_Forecasting.py",      label="📈 Dự báo nhu cầu vé",        icon="📈")
             st.page_link("pages/4_Review_Analytics.py", label="⭐ Review Analytics",          icon="⭐")
             st.page_link("pages/5_DSS_Dashboard.py",    label="💡 DSS Recommendations",       icon="💡")
+            st.page_link("pages/6_What_If_Analysis.py", label="🎛️ Mô phỏng What-If",         icon="🎛️")
             st.page_link("pages/0_Thu_vien_thanh_phan.py", label="🧩 Thư viện thành phần",   icon="🎨")
 
         st.markdown("---")
@@ -387,7 +388,7 @@ def render_home_page(user: dict[str, Any]) -> None:
     # Các nút điều hướng nhanh theo vai trò
     if role == "MANAGER":
         st.markdown("#### 🚀 Truy cập nhanh:")
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
         with c1:
             st.page_link("pages/1_KPI_Dashboard.py",    label="📊 KPI Dashboard")
         with c2:
@@ -398,6 +399,8 @@ def render_home_page(user: dict[str, Any]) -> None:
             st.page_link("pages/4_Review_Analytics.py", label="⭐ Reviews")
         with c5:
             st.page_link("pages/5_DSS_Dashboard.py",    label="💡 DSS")
+        with c6:
+            st.page_link("pages/6_What_If_Analysis.py", label="🎛️ What-If")
     else:
         st.markdown("#### 🚀 Truy cập nhanh:")
         c1, c2 = st.columns(2)

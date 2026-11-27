@@ -1081,3 +1081,35 @@ def load_app_users() -> pd.DataFrame:
     except Exception:
         logger.exception("Error loading app users")
         return _error_df("Không thể tải danh sách tài khoản.")
+
+
+# ---------------------------------------------------------------------------
+# F. What-If Simulation Baseline (Task 11 — UC07, Read-Only)
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_what_if_baseline(
+    cinema_key: Optional[int],
+    start_date: date,
+    end_date: date,
+) -> dict[str, Any]:
+    """
+    Tải BaselineMetrics cho mô phỏng What-If từ PostgreSQL (read-only).
+    Phân biệt rõ status='OK', 'NO_DATA', và 'ERROR' (không lộ SQL credentials).
+    """
+    try:
+        from core.what_if import fetch_baseline_from_db
+
+        eng = _engine()
+        baseline = fetch_baseline_from_db(eng, cinema_key, start_date, end_date)
+        if baseline is None:
+            return {"status": "NO_DATA", "baseline": None}
+        return {"status": "OK", "baseline": baseline}
+    except ValueError as exc:
+        return {"status": "INVALID", "error": str(exc)}
+    except Exception:
+        logger.exception("Error loading What-If baseline")
+        return {
+            "status": "ERROR",
+            "error": "Không thể tải dữ liệu nền What-If từ cơ sở dữ liệu.",
+        }
